@@ -124,6 +124,7 @@ export const BUSY_PICKER_ITEMS: readonly PickerItem[] = [
 
 export const SETTINGS_PICKER_ITEMS: readonly PickerItem[] = [
   { value: 'summary', label: 'Current settings', description: 'Show active session and default values' },
+  { value: 'transcript-density', label: 'Transcript detail', description: 'Choose how much transcript detail to show' },
   { value: 'model', label: 'Model', description: 'Switch provider and model' },
   { value: 'reasoning', label: 'Reasoning effort', description: 'Select effort for the current model' },
   { value: 'permission', label: 'Permission', description: 'Set this session’s tool-access preset' },

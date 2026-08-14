@@ -328,6 +328,147 @@ test('projects mounted Harness runtime state and synthetic context distinctly', 
   assert.equal(state.entries.at(-1)?.role, 'system')
 })
 
+test('projects structured context metadata into semantic transcript summaries', () => {
+  const cases = [
+    {
+      source: { kind: 'skill-invocation', form: 'instructions', name: 'frontend-design' },
+      form: 'instructions', summary: 'Skill loaded · frontend-design',
+    },
+    {
+      source: { kind: 'skill-catalog', form: 'catalog', entries: [{ name: 'a' }, { name: 'b' }] },
+      form: 'catalog', summary: 'Skills available · 2',
+    },
+    {
+      source: { kind: 'agent-instructions', form: 'instructions', baseline: true, changes: [{ path: 'AGENTS.md' }] },
+      form: 'instructions', summary: 'Workspace instructions loaded · AGENTS.md',
+    },
+    {
+      source: { kind: 'session-reference', form: 'recall', references: [{ label: 'Prior work' }] },
+      form: 'recall', summary: 'Session context recalled · Prior work',
+    },
+    {
+      source: { kind: 'subagent-settled', form: 'notice', summary: 'Worker completed' },
+      form: 'notice', summary: 'Worker completed',
+    },
+    {
+      source: { kind: 'plugin', plugin: 'tool-jobs', form: 'notice', summary: 'Background job finished' },
+      form: 'notice', summary: 'Background job finished',
+    },
+    {
+      source: { kind: 'future-plugin', form: 'future-form' },
+      form: 'opaque', summary: 'Context · future-plugin',
+    },
+  ] as const
+
+  let state = createProjection('session-1')
+  for (const [index, candidate] of cases.entries()) {
+    state = foldSessionEvent(state, {
+      seq: index + 1,
+      time: index + 1,
+      type: 'user/message',
+      data: { source: candidate.source, content: [{ type: 'text', text: `body-${String(index)}` }] },
+    })
+    assert.equal(state.entries[index]?.context?.form, candidate.form)
+    assert.equal(state.entries[index]?.context?.summary, candidate.summary)
+  }
+})
+
+test('retains structured tool outcome summaries from Harness presentation views', () => {
+  const resultViews: Record<string, unknown> = {
+    terminal: { card: 'terminal', output: 'one\ntwo', exitCode: 0 },
+    read: { card: 'read', path: 'src/a.ts', totalLines: 90, lines: [] },
+    search: { card: 'search', shape: 'matches', files: [], total: 12, truncated: true },
+    web: { card: 'web', kind: 'search', sources: [{ title: 'A' }, { title: 'B' }], truncated: false },
+    web_fetch: { card: 'web', kind: 'fetch', statusCode: 200, url: 'https://example.com', truncated: true },
+    diff: { card: 'diff', diffs: [{ path: 'src/a.ts', oldText: 'a\nb', newText: 'a\nc\nd' }] },
+    diff_separated: { card: 'diff', diffs: [{ path: 'src/b.ts', oldText: 'a\nkeep\nb', newText: 'x\nkeep\ny' }] },
+    diff_large: { card: 'diff', diffs: [{ path: 'src/large.ts', oldText: 'a'.repeat(20_001), newText: 'b'.repeat(20_001) }] },
+    generic: { card: 'generic', content: [{ type: 'text', text: 'one\ntwo\nthree' }] },
+  }
+  const expected = new Map([
+    ['terminal', 'exit 0 · 2 lines'],
+    ['read', 'src/a.ts · 90 lines'],
+    ['search', '12 matches · truncated'],
+    ['web', '2 sources'],
+    ['web_fetch', '200 · https://example.com · truncated'],
+    ['diff', '1 file · +2 −1'],
+    ['diff_separated', '1 file · +2 −2'],
+    ['diff_large', '1 file changed'],
+    ['generic', '3 lines'],
+  ])
+  const presenter = {
+    presentCall(name: string) {
+      return { card: name === 'terminal' ? 'terminal' : 'generic', title: name }
+    },
+    presentResult(name: string) {
+      return resultViews[name]
+    },
+  }
+
+  for (const [index, name] of [...expected.keys()].entries()) {
+    let state = foldSessionEvent(createProjection('session-1'), {
+      seq: index * 2 + 1,
+      time: index * 2 + 1,
+      type: 'tool/call',
+      data: { callId: name, name, arguments: '{}' },
+    }, presenter)
+    state = foldSessionEvent(state, {
+      seq: index * 2 + 2,
+      time: index * 2 + 2,
+      type: 'tool/result',
+      data: {
+        message: {
+          source: { kind: 'tool', callId: name },
+          content: [{ type: 'tool-result', toolCallId: name, isError: false, content: [{ type: 'text', text: 'fallback' }] }],
+        },
+      },
+    }, presenter)
+    assert.equal(state.entries[0]?.toolPresentation?.summary, expected.get(name))
+  }
+})
+
+test('uses rc.6 error identity instead of stale call arguments for empty tool failures', () => {
+  let state = foldSessionEvent(createProjection('session-1'), {
+    seq: 1,
+    time: 1,
+    type: 'tool/call',
+    data: { callId: 'broken', name: 'x', arguments: '{}' },
+  })
+  state = foldSessionEvent(state, {
+    seq: 2,
+    time: 2,
+    type: 'tool/result',
+    data: {
+      error: { name: 'HarnessError', code: 'BROKEN' },
+      message: {
+        source: { kind: 'tool', callId: 'broken' },
+        content: [{ type: 'tool-result', toolCallId: 'broken', isError: true, content: [] }],
+      },
+    },
+  })
+
+  assert.equal(state.entries[0]?.detail, 'HarnessError · BROKEN')
+  assert.equal(state.entries[0]?.error, true)
+})
+
+test('classifies routine, todo, goal, approval, and retry system entries', () => {
+  let state = createProjection('session-1')
+  state = foldSessionEvent(state, { seq: 1, time: 1, type: 'plan/mode', data: { active: true } })
+  state = foldSessionEvent(state, { seq: 2, time: 2, type: 'todo/write', data: { todos: [{ content: 'Test', status: 'pending' }] } })
+  state = foldSessionEvent(state, {
+    seq: 3, time: 3, type: 'goal/change',
+    data: { operation: 'create', goal: { objective: 'Ship', phase: 'active' } },
+  })
+  state = foldSessionEvent(state, { seq: 4, time: 4, type: 'approval/decided', data: { id: 'a', outcome: 'allowed-once' } })
+  state = foldSessionEvent(state, {
+    seq: 5, time: 5, type: 'llm/retry',
+    data: { retryId: 'r', turn: 1, step: 1, provider: 'deepseek', retry: 1, delayMs: 100 },
+  })
+
+  assert.deepEqual(state.entries.map(entry => entry.systemKind), ['routine', 'todo', 'goal', 'approval', 'retry'])
+  assert.equal(state.entries[1]?.systemSummary, 'Todos · 1 active')
+})
+
 test('captures the complete model selection for status and settings', () => {
   const state = foldSessionEvent(createProjection('session-1'), {
     seq: 0,

@@ -1,13 +1,31 @@
 import type { SessionEvent, TodoItem } from '@deepseek-ai/dsh-session'
 import type { TokenUsage } from '@deepseek-ai/dsh-llm'
+import { diffLines } from 'diff'
 
 export type TranscriptRole = 'user' | 'assistant' | 'tool' | 'system'
 export type TranscriptKind = 'text' | 'reasoning' | 'tool'
+export type ContextForm = 'instructions' | 'catalog' | 'snapshot' | 'notice' | 'relay' | 'recall' | 'opaque'
+export type SystemEntryKind = 'routine' | 'todo' | 'goal' | 'approval' | 'retry' | 'important'
+
+const DIFF_SUMMARY_MAX_FILES = 100
+const DIFF_SUMMARY_MAX_CHARS_PER_FILE = 20_000
 
 export interface FileDiff {
   path: string
   oldText: string | null
   newText: string
+}
+
+export interface ContextPresentation {
+  form: ContextForm
+  sourceKind: string
+  label: string
+  summary: string
+}
+
+export interface ToolPresentation {
+  card: 'terminal' | 'generic' | 'diff' | 'read' | 'search' | 'web' | 'unknown'
+  summary?: string
 }
 
 export interface TranscriptEntry {
@@ -20,6 +38,10 @@ export interface TranscriptEntry {
   diffs?: FileDiff[]
   toolName?: string
   toolArguments?: unknown
+  context?: ContextPresentation
+  toolPresentation?: ToolPresentation
+  systemKind?: SystemEntryKind
+  systemSummary?: string
   error?: boolean
 }
 
@@ -70,15 +92,108 @@ function replaceEntry(entries: TranscriptEntry[], entry: TranscriptEntry): Trans
   return next
 }
 
-function systemEntry(state: ProjectionState, id: string, text: string, error = false): TranscriptEntry[] {
+function systemEntry(
+  state: ProjectionState,
+  id: string,
+  text: string,
+  systemKind: SystemEntryKind = 'important',
+  error = false,
+  systemSummary?: string,
+): TranscriptEntry[] {
   return replaceEntry(state.entries, {
     id: `system:${id}`,
     role: 'system',
     kind: 'text',
     text,
     streaming: false,
+    systemKind,
+    ...(systemSummary === undefined ? {} : { systemSummary }),
     ...(error ? { error: true } : {}),
   })
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+function stringField(record: Record<string, unknown> | undefined, field: string): string | undefined {
+  const value = record?.[field]
+  return typeof value === 'string' && value.trim() !== '' ? value : undefined
+}
+
+function arrayField(record: Record<string, unknown> | undefined, field: string): unknown[] {
+  const value = record?.[field]
+  return Array.isArray(value) ? value : []
+}
+
+function joinedFields(values: readonly unknown[], field: string): string | undefined {
+  const labels = values.flatMap(value => {
+    const label = stringField(asRecord(value), field)
+    return label === undefined ? [] : [label]
+  })
+  return labels.length === 0 ? undefined : labels.join(', ')
+}
+
+function knownContextForm(value: unknown): ContextForm {
+  switch (value) {
+    case 'instructions':
+    case 'catalog':
+    case 'snapshot':
+    case 'notice':
+    case 'relay':
+    case 'recall':
+      return value
+    default:
+      return 'opaque'
+  }
+}
+
+function contextPresentation(source: unknown): ContextPresentation {
+  const record = asRecord(source)
+  const sourceKind = stringField(record, 'kind') ?? 'unknown'
+  const form = knownContextForm(record?.form)
+
+  if (sourceKind === 'skill-invocation') {
+    const name = stringField(record, 'name') ?? 'unknown'
+    return { form, sourceKind, label: name, summary: `Skill loaded · ${name}` }
+  }
+  if (sourceKind === 'skill-catalog') {
+    const count = arrayField(record, 'entries').length
+    const action = record?.update === true ? 'updated' : 'available'
+    return { form, sourceKind, label: 'skills', summary: `Skills ${action} · ${String(count)}` }
+  }
+  if (sourceKind === 'agent-instructions') {
+    const changes = arrayField(record, 'changes')
+    const paths = joinedFields(changes, 'path')
+    const action = record?.baseline === true ? 'loaded' : 'updated'
+    const suffix = paths ?? `${String(changes.length)} file${changes.length === 1 ? '' : 's'}`
+    return { form, sourceKind, label: paths ?? 'workspace', summary: `Workspace instructions ${action} · ${suffix}` }
+  }
+  if (sourceKind === 'session-reference') {
+    const references = arrayField(record, 'references')
+    const labels = joinedFields(references, 'label')
+    const suffix = labels ?? `${String(references.length)} session${references.length === 1 ? '' : 's'}`
+    return { form, sourceKind, label: labels ?? 'sessions', summary: `Session context recalled · ${suffix}` }
+  }
+  const label = sourceKind
+  if (form === 'notice') {
+    return { form, sourceKind, label, summary: stringField(record, 'summary') ?? `Notice · ${label}` }
+  }
+  if (form === 'snapshot') {
+    const sections = joinedFields(arrayField(record, 'sections'), 'name')
+    return { form, sourceKind, label, summary: `Context snapshot${sections === undefined ? '' : ` · ${sections}`}` }
+  }
+  if (form === 'instructions') return { form, sourceKind, label, summary: `Instructions · ${label}` }
+  if (form === 'catalog') return { form, sourceKind, label, summary: `Catalog · ${label}` }
+  if (form === 'relay') return { form, sourceKind, label, summary: `Agent message · ${label}` }
+  if (form === 'recall') return { form, sourceKind, label, summary: `Recalled context · ${label}` }
+  if (sourceKind === 'plugin') {
+    const plugin = stringField(record, 'plugin') ?? 'plugin'
+    return { form, sourceKind, label: plugin, summary: `Plugin context · ${plugin}` }
+  }
+  return { form, sourceKind, label, summary: `Context · ${label}` }
 }
 
 function textFromBlocks(content: unknown): string {
@@ -165,9 +280,9 @@ function callPresentationDetail(view: any, argumentsValue: unknown): string | un
 function resultPresentationDetail(view: any, fallback: string | undefined): string | undefined {
   switch (view?.card) {
     case 'terminal': {
-      const status = typeof view.exitCode === 'number'
-        ? `exit ${String(view.exitCode)}`
-        : typeof view.signal === 'string' ? `signal ${view.signal}` : undefined
+      let status: string | undefined
+      if (typeof view.exitCode === 'number') status = `exit ${String(view.exitCode)}`
+      else if (typeof view.signal === 'string') status = `signal ${view.signal}`
       return [typeof view.output === 'string' ? view.output : undefined, status].filter(Boolean).join('\n') || fallback
     }
     case 'generic':
@@ -202,6 +317,120 @@ function resultPresentationDetail(view: any, fallback: string | undefined): stri
       return fallback
     default:
       return fallback
+  }
+}
+
+function toolErrorIdentity(error: unknown): string | undefined {
+  const record = asRecord(error)
+  const name = stringField(record, 'name')
+  const code = stringField(record, 'code')
+  return [name, code].filter(Boolean).join(' · ') || undefined
+}
+
+function appendErrorIdentity(detail: string | undefined, identity: string | undefined): string | undefined {
+  if (identity === undefined || detail?.includes(identity)) return detail
+  return detail === undefined || detail === '' ? identity : `${detail}\n${identity}`
+}
+
+function presentationCard(view: any): ToolPresentation['card'] {
+  switch (view?.card) {
+    case 'terminal':
+    case 'generic':
+    case 'diff':
+    case 'read':
+    case 'search':
+    case 'web':
+      return view.card
+    default:
+      return 'unknown'
+  }
+}
+
+function contentLineCount(value: string | undefined): number {
+  if (value === undefined) return 0
+  let end = value.length
+  while (end > 0 && (value[end - 1] === '\n' || value[end - 1] === '\r')) end -= 1
+  if (end === 0) return 0
+  let lines = 1
+  let hasContent = false
+  for (let index = 0; index < end; index += 1) {
+    const character = value[index]!
+    if (character === '\n') lines += 1
+    else if (character !== ' ' && character !== '\t' && character !== '\r') hasContent = true
+  }
+  return hasContent ? lines : 0
+}
+
+function diffLineCounts(diff: FileDiff): { added: number; removed: number } {
+  const changes = diffLines(diff.oldText ?? '', diff.newText)
+  return changes.reduce((total, change) => ({
+    added: total.added + (change.added ? change.count ?? 0 : 0),
+    removed: total.removed + (change.removed ? change.count ?? 0 : 0),
+  }), { added: 0, removed: 0 })
+}
+
+function diffSummary(diffs: readonly FileDiff[] | undefined): string | undefined {
+  if (diffs === undefined || diffs.length === 0) return undefined
+  const fileLabel = `${String(diffs.length)} file${diffs.length === 1 ? '' : 's'}`
+  const isBounded = diffs.length <= DIFF_SUMMARY_MAX_FILES && diffs.every(diff =>
+    (diff.oldText?.length ?? 0) + diff.newText.length <= DIFF_SUMMARY_MAX_CHARS_PER_FILE)
+  if (!isBounded) return `${fileLabel} changed`
+  const counts = diffs.reduce((total, diff) => {
+    const next = diffLineCounts(diff)
+    return { added: total.added + next.added, removed: total.removed + next.removed }
+  }, { added: 0, removed: 0 })
+  return `${fileLabel} · +${String(counts.added)} −${String(counts.removed)}`
+}
+
+function resultPresentationSummary(
+  view: any,
+  detail: string | undefined,
+  diffs: readonly FileDiff[] | undefined,
+): string | undefined {
+  switch (view?.card) {
+    case 'terminal': {
+      let status: string | undefined
+      if (typeof view.exitCode === 'number') {
+        status = `exit ${String(view.exitCode)}`
+      } else if (typeof view.signal === 'string') {
+        status = `signal ${view.signal}`
+      }
+      const lines = contentLineCount(typeof view.output === 'string' ? view.output : detail)
+      return [status, lines > 0 ? `${String(lines)} line${lines === 1 ? '' : 's'}` : undefined]
+        .filter(Boolean).join(' · ') || undefined
+    }
+    case 'read': {
+      const path = typeof view.path === 'string' ? view.path : undefined
+      const total = Number.isInteger(view.totalLines) ? `${String(view.totalLines)} lines` : undefined
+      return [path, total].filter(Boolean).join(' · ') || undefined
+    }
+    case 'search': {
+      const total = Number.isInteger(view.total) ? Number(view.total) : undefined
+      if (total === undefined) return undefined
+      const unit = view.shape === 'paths' ? 'path' : 'match'
+      let plural = ''
+      if (total !== 1) plural = unit === 'path' ? 's' : 'es'
+      return `${String(total)} ${unit}${plural}${view.truncated ? ' · truncated' : ''}`
+    }
+    case 'web':
+      if (view.kind === 'fetch') {
+        return [
+          Number.isInteger(view.statusCode) ? String(view.statusCode) : undefined,
+          typeof view.url === 'string' ? view.url : undefined,
+          view.truncated ? 'truncated' : undefined,
+        ]
+          .filter(Boolean).join(' · ') || undefined
+      }
+      if (view.kind === 'search' && Array.isArray(view.sources)) {
+        return `${String(view.sources.length)} source${view.sources.length === 1 ? '' : 's'}${view.truncated ? ' · truncated' : ''}`
+      }
+      return undefined
+    case 'diff':
+      return diffSummary(diffs)
+    default: {
+      const lines = contentLineCount(detail)
+      return lines > 1 ? `${String(lines)} lines` : undefined
+    }
   }
 }
 
@@ -271,6 +500,7 @@ export function foldSessionEvent(state: ProjectionState, event: EventLike, prese
           kind: 'text',
           text,
           streaming: false,
+          ...(human ? {} : { context: contextPresentation(data?.source) }),
         }],
       }
     }
@@ -318,6 +548,7 @@ export function foldSessionEvent(state: ProjectionState, event: EventLike, prese
           diffs: validDiffs(view?.diffs),
           toolName: name,
           toolArguments: argumentsValue,
+          toolPresentation: { card: presentationCard(view) },
           streaming: true,
         }),
       }
@@ -332,6 +563,7 @@ export function foldSessionEvent(state: ProjectionState, event: EventLike, prese
       const text = textFromBlocks(content)
       const isError = data?.error !== undefined || block?.isError === true
       if (prior === undefined && active?.name === 'ask_user_question') {
+        const errorIdentity = toolErrorIdentity(data?.error)
         return {
           ...state,
           activeTools: state.activeTools.filter(tool => tool.id !== id),
@@ -340,7 +572,7 @@ export function foldSessionEvent(state: ProjectionState, event: EventLike, prese
             role: 'tool',
             kind: 'tool',
             text: isError ? 'User question failed' : 'User answered question',
-            detail: text || data?.error?.message,
+            detail: appendErrorIdentity(text || undefined, errorIdentity),
             toolName: active.name,
             error: isError,
             streaming: false,
@@ -354,6 +586,12 @@ export function foldSessionEvent(state: ProjectionState, event: EventLike, prese
             isError,
             ...(data?.meta === undefined ? {} : { meta: data.meta }),
           }))
+      const errorIdentity = toolErrorIdentity(data?.error)
+      const fallback = text || (isError ? errorIdentity : prior?.detail)
+      const presentedDetail = resultPresentationDetail(view, fallback)
+      const detail = isError ? appendErrorIdentity(presentedDetail, errorIdentity) : presentedDetail
+      const diffs = validDiffs(view?.diffs) ?? prior?.diffs
+      const card = view === undefined ? prior?.toolPresentation?.card ?? 'unknown' : presentationCard(view)
       return {
         ...state,
         activeTools: state.activeTools.filter(tool => tool.id !== id),
@@ -362,10 +600,14 @@ export function foldSessionEvent(state: ProjectionState, event: EventLike, prese
           role: 'tool',
           kind: 'tool',
           text: typeof view?.title === 'string' ? view.title : prior?.text ?? prior?.toolName ?? 'tool',
-          detail: resultPresentationDetail(view, text || data?.error?.message || prior?.detail),
-          diffs: validDiffs(view?.diffs) ?? prior?.diffs,
+          detail,
+          diffs,
           toolName: prior?.toolName,
           toolArguments: prior?.toolArguments,
+          toolPresentation: {
+            card,
+            summary: resultPresentationSummary(view, detail, diffs) ?? prior?.toolPresentation?.summary,
+          },
           error: isError,
           streaming: false,
         }),
@@ -405,17 +647,25 @@ export function foldSessionEvent(state: ProjectionState, event: EventLike, prese
     case 'todo/write': {
       const todos = Array.isArray(data?.todos) ? data.todos : []
       const lines = todos.map((todo: any) => `- [${todo?.status === 'completed' ? 'x' : ' '}] ${String(todo?.content ?? '')}`)
+      const active = todos.filter((todo: any) => todo?.status !== 'completed').length
       return {
         ...state,
         todos,
-        entries: systemEntry(state, 'todos', `Todos\n${lines.join('\n') || 'No active todos.'}`),
+        entries: systemEntry(
+          state,
+          'todos',
+          `Todos\n${lines.join('\n') || 'No active todos.'}`,
+          'todo',
+          false,
+          `Todos · ${String(active)} active`,
+        ),
       }
     }
     case 'compaction/start':
       return {
         ...state,
         compacting: true,
-        entries: systemEntry(state, `compaction:${String(data?.compactionId ?? 'current')}`, 'Compacting context…'),
+        entries: systemEntry(state, `compaction:${String(data?.compactionId ?? 'current')}`, 'Compacting context…', 'routine'),
       }
     case 'compaction/summary':
       return {
@@ -425,6 +675,7 @@ export function foldSessionEvent(state: ProjectionState, event: EventLike, prese
           state,
           `compaction:${String(data?.compactionId ?? 'current')}`,
           `Context summary created · ${String(data?.shadowedTokenCount ?? '?')} tokens compacted`,
+          'routine',
         ),
       }
     case 'compaction/end':
@@ -436,29 +687,30 @@ export function foldSessionEvent(state: ProjectionState, event: EventLike, prese
           state,
           `compaction:${String(data?.compactionId ?? 'current')}`,
           typeof data?.error === 'string' ? `Compaction failed: ${data.error}` : 'Context compaction complete',
+          typeof data?.error === 'string' ? 'important' : 'routine',
           typeof data?.error === 'string',
         ),
       }
     case 'compaction/prune':
       return {
         ...state,
-        entries: systemEntry(state, `prune:${event.seq}`, `Pruned ${String(data?.shadowedTokenCount ?? '?')} tokens from context`),
+        entries: systemEntry(state, `prune:${event.seq}`, `Pruned ${String(data?.shadowedTokenCount ?? '?')} tokens from context`, 'routine'),
       }
     case 'plan/mode':
       return {
         ...state,
         planMode: data?.active === true,
-        entries: systemEntry(state, `plan:${event.seq}`, `Plan mode ${data?.active === true ? 'enabled' : 'disabled'}`),
+        entries: systemEntry(state, `plan:${event.seq}`, `Plan mode ${data?.active === true ? 'enabled' : 'disabled'}`, 'routine'),
       }
     case 'permission/preset':
       return {
         ...state,
         permissionPreset: typeof data?.preset === 'string' ? data.preset : state.permissionPreset,
-        entries: systemEntry(state, `permission:${event.seq}`, `Permission preset: ${String(data?.preset ?? 'unknown')}`),
+        entries: systemEntry(state, `permission:${event.seq}`, `Permission preset: ${String(data?.preset ?? 'unknown')}`, 'routine'),
       }
     case 'goal/change': {
       if (data?.operation === 'clear') {
-        return { ...state, goal: undefined, entries: systemEntry(state, `goal:${event.seq}`, 'Goal cleared') }
+        return { ...state, goal: undefined, entries: systemEntry(state, `goal:${event.seq}`, 'Goal cleared', 'goal') }
       }
       const goal = data?.goal
       if (typeof goal?.objective !== 'string') return state
@@ -470,7 +722,7 @@ export function foldSessionEvent(state: ProjectionState, event: EventLike, prese
       return {
         ...state,
         goal: projected,
-        entries: systemEntry(state, `goal:${event.seq}`, `Goal ${String(data?.operation ?? 'updated')} · ${projected.phase}\n${projected.objective}`),
+        entries: systemEntry(state, `goal:${event.seq}`, `Goal ${String(data?.operation ?? 'updated')} · ${projected.phase}\n${projected.objective}`, 'goal'),
       }
     }
     case 'approval/asked':
@@ -478,7 +730,7 @@ export function foldSessionEvent(state: ProjectionState, event: EventLike, prese
     case 'approval/decided':
       return {
         ...state,
-        entries: systemEntry(state, `approval:${String(data?.id ?? 'unknown')}:${event.seq}`, `Approval ${String(data?.outcome ?? 'decided')}`),
+        entries: systemEntry(state, `approval:${String(data?.id ?? 'unknown')}:${event.seq}`, `Approval ${String(data?.outcome ?? 'decided')}`, 'approval'),
       }
     case 'llm/retry': {
       const retry = {
@@ -494,6 +746,7 @@ export function foldSessionEvent(state: ProjectionState, event: EventLike, prese
           { ...state, entries: state.entries.filter(entry => !entry.id.startsWith(`assistant:${String(data?.turn)}:${String(data?.step)}:`)) },
           `retry:${String(data?.retryId ?? event.seq)}`,
           `Retrying ${retry.provider} request ${String(retry.retry)}${retry.maxRetries === undefined ? '' : `/${String(retry.maxRetries)}`} in ${String(retry.delayMs)}ms`,
+          'retry',
         ),
       }
     }

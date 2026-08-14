@@ -1,5 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis';
+import type { SettingsScope } from '@deepseek-ai/dsh-settings';
 import type { TuiStartupOptions } from './startup.js';
+import { type TranscriptSettings } from './transcript-settings.js';
 import { DeepSeekTui } from './ui.js';
 export declare const name = "dsh-tui-runner";
 export declare const inject: string[];
@@ -7,6 +9,7 @@ export declare class DshTuiRunner {
     private readonly ctx;
     private readonly startup;
     private readonly ui;
+    private readonly transcriptSettings?;
     private handle?;
     private selection?;
     private readonly subscriptions;
@@ -16,7 +19,9 @@ export declare class DshTuiRunner {
     private projectionCursor;
     private closing;
     private started;
-    constructor(ctx: Context, startup: TuiStartupOptions, ui?: DeepSeekTui);
+    private localTranscriptDensity;
+    constructor(ctx: Context, startup: TuiStartupOptions, ui?: DeepSeekTui, transcriptSettings?: SettingsScope<TranscriptSettings> | undefined);
+    private get transcriptDensity();
     private get agent();
     start(): Promise<void>;
     private installInteractions;
@@ -51,9 +56,11 @@ export declare class DshTuiRunner {
     private settingsChoices;
     private chooseSettings;
     private applySetting;
+    private selectTranscriptDensity;
     private pauseAndExit;
     shutdown(requestExit: boolean, stopUi?: boolean): Promise<void>;
 }
 export declare function apply(ctx: Context): void;
 export { DeepSeekTui } from './ui.js';
 export { projectSession } from './projection.js';
+export { DEFAULT_TRANSCRIPT_DENSITY, TRANSCRIPT_DENSITIES, TRANSCRIPT_DENSITY_PICKER_ITEMS, TRANSCRIPT_SETTINGS_NAMESPACE, TRANSCRIPT_SETTINGS_SCHEMA, type TranscriptDensity, type TranscriptSettings, } from './transcript-settings.js';

@@ -26,14 +26,14 @@ class FakeTerminal implements Terminal {
 test('formats reasoning and tool entries distinctly', () => {
   assert.match(formatEntry({
     id: 'r', role: 'assistant', kind: 'reasoning', text: 'checking', streaming: true,
-  }), /Thinking.*checking/s)
+  }) ?? '', /Thinking.*checking/s)
   assert.match(formatEntry({
     id: 't', role: 'tool', kind: 'tool', text: 'bash', detail: 'ok', streaming: false,
-  }), /bash.*ok/s)
+  }) ?? '', /bash.*ok/s)
   const diff = formatEntry({
     id: 'd', role: 'tool', kind: 'tool', text: 'Edit src/a.ts', streaming: false,
     diffs: [{ path: 'src/a.ts', oldText: 'context\nbefore', newText: 'context\nafter' }],
-  })
+  }, 'debug') ?? ''
   assert.match(diff, /```diff/)
   assert.match(diff, /--- src\/a\.ts/)
   assert.match(diff, / context/)
@@ -65,9 +65,136 @@ test('strips untrusted terminal control sequences before rendering', () => {
     kind: 'text',
     text: unsafe,
     streaming: false,
-  })
+  }) ?? ''
   assert.doesNotMatch(rendered, /\u001b\]52|\u0007|\u009d/u)
   assert.match(rendered, /beforeredafter/)
+
+  const context = formatEntry({
+    id: 'unsafe-context', role: 'system', kind: 'text', text: 'hidden', streaming: false,
+    context: {
+      form: 'instructions', sourceKind: 'plugin', label: `plugin${unsafe}`,
+      summary: `Plugin context${unsafe}`,
+    },
+  }, 'debug') ?? ''
+  const tool = formatEntry({
+    id: 'unsafe-tool', role: 'tool', kind: 'tool', text: `tool${unsafe}`, streaming: false,
+    toolPresentation: { card: 'terminal', summary: `exit 0${unsafe}` },
+  }, 'normal') ?? ''
+  assert.doesNotMatch(`${context}${tool}`, /\u001b\]52|\u0007|\u009d/u)
+})
+
+test('applies compact, normal, and debug transcript density rules', () => {
+  const completedReasoning = {
+    id: 'reasoning', role: 'assistant' as const, kind: 'reasoning' as const,
+    text: 'one\ntwo\nthree\nfour', streaming: false,
+  }
+  assert.match(formatEntry(completedReasoning, 'compact') ?? '', /Thinking · 4 lines/)
+  assert.doesNotMatch(formatEntry(completedReasoning, 'normal') ?? '', /one|four/)
+  assert.match(formatEntry(completedReasoning, 'debug') ?? '', /one.*four/s)
+
+  const runningReasoning = { ...completedReasoning, streaming: true }
+  assert.doesNotMatch(formatEntry(runningReasoning, 'compact') ?? '', /one|four/)
+  assert.doesNotMatch(formatEntry(runningReasoning, 'normal') ?? '', /one/)
+  assert.match(formatEntry(runningReasoning, 'normal') ?? '', /two.*four/s)
+
+  const tool = {
+    id: 'tool', role: 'tool' as const, kind: 'tool' as const,
+    text: 'npm test', detail: 'first\nsecond', streaming: false,
+    toolPresentation: { card: 'terminal' as const, summary: 'exit 0 · 2 lines' },
+  }
+  assert.doesNotMatch(formatEntry(tool, 'compact') ?? '', /exit 0|first/)
+  assert.match(formatEntry(tool, 'normal') ?? '', /exit 0 · 2 lines/)
+  assert.doesNotMatch(formatEntry(tool, 'normal') ?? '', /first/)
+  assert.match(formatEntry(tool, 'debug') ?? '', /first.*second/s)
+
+  const runningTool = { ...tool, streaming: true }
+  assert.doesNotMatch(formatEntry(runningTool, 'normal') ?? '', /first/)
+  assert.match(formatEntry(runningTool, 'debug') ?? '', /first.*second/s)
+})
+
+test('summarizes semantic context without parsing its model-facing body', () => {
+  const context = {
+    id: 'context', role: 'system' as const, kind: 'text' as const,
+    text: '<skill_content>secret instructions</skill_content>', streaming: false,
+    context: {
+      form: 'instructions' as const,
+      sourceKind: 'skill-invocation',
+      label: 'frontend-design',
+      summary: 'Skill loaded · frontend-design',
+    },
+  }
+  assert.match(formatEntry(context, 'normal') ?? '', /Skill loaded · frontend-design/)
+  assert.doesNotMatch(formatEntry(context, 'normal') ?? '', /secret instructions/)
+  assert.match(formatEntry(context, 'debug') ?? '', /secret instructions/)
+
+  const relay = {
+    ...context,
+    id: 'relay',
+    text: 'The worker found three failures in the parser.',
+    context: { form: 'relay' as const, sourceKind: 'subagent-report', label: 'subagent-report', summary: 'Agent message · subagent-report' },
+  }
+  assert.doesNotMatch(formatEntry(relay, 'compact') ?? '', /three failures/)
+  assert.match(formatEntry(relay, 'normal') ?? '', /three failures/)
+})
+
+test('keeps errors useful and bounds normal and debug detail', () => {
+  const detail = Array.from({ length: 450 }, (_, index) => `line ${String(index + 1)}`).join('\n')
+  const failed = {
+    id: 'failed', role: 'tool' as const, kind: 'tool' as const,
+    text: 'failing command', detail, streaming: false, error: true,
+  }
+  const normal = formatEntry(failed, 'normal') ?? ''
+  assert.match(normal, /earlier lines omitted/)
+  assert.doesNotMatch(normal, /line 1\b/)
+  assert.match(normal, /line 450/)
+
+  const debug = formatEntry({ ...failed, error: false }, 'debug') ?? ''
+  assert.match(debug, /lines omitted/)
+  assert.match(debug, /line 1\b/)
+  assert.match(debug, /line 450/)
+
+  const systemFailure = {
+    id: 'system-failure', role: 'system' as const, kind: 'text' as const,
+    text: detail, streaming: false, error: true,
+  }
+  assert.doesNotMatch(formatEntry(systemFailure, 'normal') ?? '', /line 1\b/)
+  assert.match(formatEntry(systemFailure, 'normal') ?? '', /line 450/)
+  assert.match(formatEntry(systemFailure, 'debug') ?? '', /line 1\b/)
+})
+
+test('bounds debug diffs by source size, file count, and final rendered detail', () => {
+  const huge = `${'a'.repeat(20_000)}\n${'b'.repeat(20_000)}`
+  const diffs = Array.from({ length: 25 }, (_, index) => ({
+    path: `src/file-${String(index)}.ts`,
+    oldText: huge,
+    newText: `${huge}changed`,
+  }))
+  const rendered = formatEntry({
+    id: 'large-diff', role: 'tool', kind: 'tool', text: 'Edit files', detail: huge, streaming: false, diffs,
+    toolPresentation: { card: 'diff' },
+  }, 'debug') ?? ''
+
+  assert.match(rendered, /files omitted/)
+  assert.match(rendered, /source omitted/)
+  assert.ok(rendered.length < 41_000)
+})
+
+test('hides routine state outside debug and compacts todo state in normal', () => {
+  const routine = {
+    id: 'routine', role: 'system' as const, kind: 'text' as const,
+    text: 'Plan mode enabled', streaming: false, systemKind: 'routine' as const,
+  }
+  assert.equal(formatEntry(routine, 'compact'), undefined)
+  assert.equal(formatEntry(routine, 'normal'), undefined)
+  assert.match(formatEntry(routine, 'debug') ?? '', /Plan mode enabled/)
+
+  const todo = {
+    id: 'todo', role: 'system' as const, kind: 'text' as const,
+    text: 'Todos\n- [ ] Test', streaming: false, systemKind: 'todo' as const,
+    systemSummary: 'Todos · 1 active',
+  }
+  assert.equal(formatEntry(todo, 'compact'), undefined)
+  assert.match(formatEntry(todo, 'normal') ?? '', /Todos · 1 active/)
 })
 
 test('status line includes session, model, work, and token usage within width', () => {
@@ -198,6 +325,41 @@ test('keeps launch header, projected entries, and local results in arrival order
   assert.match(text[1] ?? '', /first done/)
   assert.match(text[2] ?? '', /local result/)
   assert.match(text[3] ?? '', /second/)
+})
+
+test('reveals hidden rows in their original position when density changes', () => {
+  const ui = new DeepSeekTui(new FakeTerminal())
+  ui.appendLaunchBanner('session-1', '/work')
+  const routine = {
+    id: 'system:plan:1', role: 'system' as const, kind: 'text' as const,
+    text: 'Plan mode enabled', streaming: false, systemKind: 'routine' as const,
+  }
+  ui.renderProjection({
+    sessionId: 'session-1',
+    entries: [routine, { id: 'assistant:1', role: 'assistant', kind: 'text', text: 'first', streaming: false }],
+    running: false, activeTools: [], todos: [], compacting: false, planMode: true,
+  })
+  ui.appendNotice('local result')
+  ui.renderProjection({
+    sessionId: 'session-1',
+    entries: [
+      routine,
+      { id: 'assistant:1', role: 'assistant', kind: 'text', text: 'first', streaming: false },
+      { id: 'assistant:2', role: 'assistant', kind: 'text', text: 'second', streaming: false },
+    ],
+    running: false, activeTools: [], todos: [], compacting: false, planMode: true,
+  })
+
+  const children = (ui as unknown as { transcript: { children: Component[] } }).transcript.children
+  assert.equal(children[1]?.render(100).length, 0)
+  ui.setTranscriptDensity('debug')
+  const debug = children.map(child => child.render(100).join('\n'))
+  assert.match(debug[1] ?? '', /Plan mode enabled/)
+  assert.match(debug[2] ?? '', /first/)
+  assert.match(debug[3] ?? '', /local result/)
+  assert.match(debug[4] ?? '', /second/)
+  ui.setTranscriptDensity('normal')
+  assert.equal(children[1]?.render(100).length, 0)
 })
 
 test('renders choices above the composer without adding their prompt to history', async () => {

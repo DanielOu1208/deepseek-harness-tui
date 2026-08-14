@@ -2,10 +2,22 @@ import type { SessionEvent, TodoItem } from '@deepseek-ai/dsh-session';
 import type { TokenUsage } from '@deepseek-ai/dsh-llm';
 export type TranscriptRole = 'user' | 'assistant' | 'tool' | 'system';
 export type TranscriptKind = 'text' | 'reasoning' | 'tool';
+export type ContextForm = 'instructions' | 'catalog' | 'snapshot' | 'notice' | 'relay' | 'recall' | 'opaque';
+export type SystemEntryKind = 'routine' | 'todo' | 'goal' | 'approval' | 'retry' | 'important';
 export interface FileDiff {
     path: string;
     oldText: string | null;
     newText: string;
+}
+export interface ContextPresentation {
+    form: ContextForm;
+    sourceKind: string;
+    label: string;
+    summary: string;
+}
+export interface ToolPresentation {
+    card: 'terminal' | 'generic' | 'diff' | 'read' | 'search' | 'web' | 'unknown';
+    summary?: string;
 }
 export interface TranscriptEntry {
     id: string;
@@ -17,6 +29,10 @@ export interface TranscriptEntry {
     diffs?: FileDiff[];
     toolName?: string;
     toolArguments?: unknown;
+    context?: ContextPresentation;
+    toolPresentation?: ToolPresentation;
+    systemKind?: SystemEntryKind;
+    systemSummary?: string;
     error?: boolean;
 }
 export interface ProjectionState {

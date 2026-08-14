@@ -26,6 +26,7 @@ import {
   type Terminal,
 } from '@earendil-works/pi-tui'
 import type { FileDiff, ProjectionState, TranscriptEntry } from './projection.js'
+import type { TranscriptDensity } from './transcript-settings.js'
 
 const ansi = (code: string) => (text: string): string => `\u001b[${code}m${text}\u001b[0m`
 const plain = (text: string): string => text
@@ -38,6 +39,15 @@ const red = ansi('31')
 const green = ansi('32')
 const magenta = ansi('35')
 const BANNER_CONTROLS = '/ commands · @ files · F2 settings · Ctrl+C stop / ×2 exit · Ctrl+D exit · /help'
+const SUMMARY_MAX_CHARS = 120
+const NORMAL_REASONING_LINES = 3
+const NORMAL_REASONING_CHARS = 600
+const ERROR_DETAIL_LINES = 12
+const ERROR_DETAIL_CHARS = 4_000
+const DEBUG_DETAIL_LINES = 400
+const DEBUG_DETAIL_CHARS = 40_000
+const DEBUG_DIFF_FILES = 20
+const DEBUG_DIFF_SIDE_CHARS = 5_000
 
 /**
  * Remove terminal control strings supplied by models, tools, files, or plugins.
@@ -217,10 +227,16 @@ export function renderLaunchBanner(sessionId: string, cwd: string): string {
   return `${deepseekBlue(OFFICIAL_DEEPSEEK_RASTER)}\n\n${bold(deepseekBlue('DeepSeek Harness TUI'))}\n${dim(`session  ${sanitizeTerminalText(sessionId)}`)}\n${dim(`cwd      ${sanitizeTerminalText(cwd)}`)}\n${dim(BANNER_CONTROLS)}`
 }
 
+function boundedDiffSource(text: string): string {
+  if (text.length <= DEBUG_DIFF_SIDE_CHARS) return text
+  const edge = Math.floor((DEBUG_DIFF_SIDE_CHARS - 32) / 2)
+  return `${text.slice(0, edge)}\n… source omitted …\n${text.slice(-edge)}`
+}
+
 function renderFileDiff(diff: FileDiff): string {
-  const path = sanitizeTerminalText(diff.path)
-  const oldLines = diff.oldText === null ? [] : sanitizeTerminalText(diff.oldText).split('\n')
-  const newLines = sanitizeTerminalText(diff.newText).split('\n')
+  const path = sanitizeTerminalText(boundedDiffSource(diff.path)).replace(/\s+/gu, ' ')
+  const oldLines = diff.oldText === null ? [] : sanitizeTerminalText(boundedDiffSource(diff.oldText)).split('\n')
+  const newLines = sanitizeTerminalText(boundedDiffSource(diff.newText)).split('\n')
   let prefix = 0
   while (prefix < oldLines.length && prefix < newLines.length && oldLines[prefix] === newLines[prefix]) prefix += 1
   let suffix = 0
@@ -243,9 +259,19 @@ function renderFileDiff(diff: FileDiff): string {
   return [...lines.slice(0, edge), `… ${String(lines.length - edge * 2)} diff lines omitted …`, ...lines.slice(-edge)].join('\n')
 }
 
-function renderDiffs(diffs: readonly FileDiff[] | undefined): string | undefined {
+function renderDiffs(
+  diffs: readonly FileDiff[] | undefined,
+  maxLines = DEBUG_DETAIL_LINES,
+  maxChars = DEBUG_DETAIL_CHARS,
+): string | undefined {
   if (diffs === undefined || diffs.length === 0) return undefined
-  return `\`\`\`diff\n${diffs.map(renderFileDiff).join('\n\n')}\n\`\`\``
+  const retained = diffs.length <= DEBUG_DIFF_FILES
+    ? diffs
+    : [...diffs.slice(0, DEBUG_DIFF_FILES / 2), ...diffs.slice(-DEBUG_DIFF_FILES / 2)]
+  const omitted = diffs.length - retained.length
+  const rendered = retained.map(renderFileDiff)
+  if (omitted > 0) rendered.unshift(`… ${String(omitted)} files omitted …`)
+  return `\`\`\`diff\n${debugPreview(rendered.join('\n\n'), maxLines, maxChars)}\n\`\`\``
 }
 
 const selectTheme: SelectListTheme = {
@@ -278,20 +304,183 @@ const markdownTheme: MarkdownTheme = {
   underline: ansi('4'),
 }
 
-export function formatEntry(entry: TranscriptEntry): string {
+function lineCount(text: string): number {
+  let end = text.length
+  while (end > 0 && (text[end - 1] === '\n' || text[end - 1] === '\r')) end -= 1
+  if (end === 0) return 0
+  let lines = 1
+  let hasContent = false
+  for (let index = 0; index < end; index += 1) {
+    const character = text[index]!
+    if (character === '\n') lines += 1
+    else if (character !== ' ' && character !== '\t' && character !== '\r') hasContent = true
+  }
+  return hasContent ? lines : 0
+}
+
+function oneLine(text: string, maxChars = SUMMARY_MAX_CHARS): string {
+  const compact = sanitizeTerminalText(text).replace(/\s+/gu, ' ').trim()
+  if (compact.length <= maxChars) return compact
+  return `${compact.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`
+}
+
+function tailPreview(text: string, maxLines: number, maxChars: number): string {
+  const trimmed = text.trim()
+  const omittedChars = trimmed.length > maxChars
+  const charBounded = omittedChars ? trimmed.slice(-maxChars) : trimmed
+  const lines = charBounded.split('\n')
+  const retainedLines = lines.slice(-maxLines)
+  const retained = retainedLines.join('\n')
+  const omittedLines = Math.max(0, lines.length - retainedLines.length)
+  if (omittedLines === 0 && !omittedChars) return retained
+  let marker = '… earlier content omitted …'
+  if (omittedLines > 0) {
+    const unit = omittedLines === 1 ? 'line' : 'lines'
+    marker = `… ${String(omittedLines)} earlier ${unit} omitted …`
+  }
+  return `${marker}\n${retained}`
+}
+
+function debugPreview(
+  text: string,
+  maxLines = DEBUG_DETAIL_LINES,
+  maxChars = DEBUG_DETAIL_CHARS,
+): string {
+  const trimmed = text.trim()
+  let bounded = trimmed
+  if (bounded.length > maxChars) {
+    const edge = Math.floor((maxChars - 32) / 2)
+    bounded = `${bounded.slice(0, edge)}\n… content omitted …\n${bounded.slice(-edge)}`
+  }
+  const lines = bounded.split('\n')
+  if (lines.length > maxLines) {
+    const edge = Math.floor((maxLines - 1) / 2)
+    bounded = [
+      ...lines.slice(0, edge),
+      `… ${String(lines.length - edge * 2)} lines omitted …`,
+      ...lines.slice(-edge),
+    ].join('\n')
+  }
+  return bounded
+}
+
+function detailBlock(detail: string | undefined): string {
+  return detail === undefined || detail === '' ? '' : `\n\n\`\`\`text\n${detail}\n\`\`\``
+}
+
+function formatReasoning(entry: TranscriptEntry, text: string, density: TranscriptDensity): string {
+  const lines = lineCount(text)
+  if (density === 'debug') return `${dim('Thinking')}\n${dim(debugPreview(text || '…'))}`
+  if (!entry.streaming) return dim(`Thinking · ${String(lines)} line${lines === 1 ? '' : 's'}`)
+  if (density === 'compact') return dim('Thinking…')
+  const preview = tailPreview(text || '…', NORMAL_REASONING_LINES, NORMAL_REASONING_CHARS)
+  return `${dim('Thinking…')}\n${dim(preview)}`
+}
+
+function formatTool(entry: TranscriptEntry, text: string, density: TranscriptDensity): string {
+  let mark: string
+  if (entry.error) mark = red('✗')
+  else if (entry.streaming) mark = yellow('◆')
+  else mark = green('✓')
+  const header = `${mark} ${bold(text)}`
+  const detail = entry.detail === undefined ? undefined : sanitizeTerminalText(entry.detail).trim()
+
+  if (entry.error) {
+    let errorDetail: string | undefined
+    if (detail !== undefined) {
+      errorDetail = density === 'debug'
+        ? debugPreview(detail)
+        : tailPreview(detail, ERROR_DETAIL_LINES, ERROR_DETAIL_CHARS)
+    }
+    return `${header}${detailBlock(errorDetail)}`
+  }
+  if (density === 'compact') return header
+  if (density === 'debug') {
+    const hasDetail = detail !== undefined && detail !== ''
+    const hasDiffs = entry.diffs !== undefined && entry.diffs.length > 0
+    const maxLines = hasDetail && hasDiffs ? DEBUG_DETAIL_LINES / 2 : DEBUG_DETAIL_LINES
+    const maxChars = hasDetail && hasDiffs ? DEBUG_DETAIL_CHARS / 2 : DEBUG_DETAIL_CHARS
+    const boundedDetail = hasDetail ? debugPreview(detail, maxLines, maxChars) : undefined
+    const diff = renderDiffs(entry.diffs, maxLines, maxChars)
+    return `${header}${detailBlock(boundedDetail)}${diff ? `\n\n${diff}` : ''}`
+  }
+  if (entry.streaming) return header
+
+  const summary = entry.toolPresentation?.summary === undefined
+    ? undefined
+    : oneLine(entry.toolPresentation.summary)
+  const card = entry.toolPresentation?.card ?? 'unknown'
+  const canPreview = card === 'generic' || card === 'unknown'
+  const preview = canPreview && entry.toolName !== 'ask_user_question' && detail
+    ? oneLine(detail)
+    : undefined
+  const suffix = [summary, preview].filter((part, index, parts): part is string =>
+    part !== undefined && part !== '' && parts.indexOf(part) === index).join(' · ')
+  return suffix === '' ? header : `${header} ${dim(`· ${suffix}`)}`
+}
+
+function formatContext(entry: TranscriptEntry, text: string, density: TranscriptDensity): string {
+  const context = entry.context!
+  const summary = oneLine(context.summary)
+  if (density === 'debug') {
+    return `${yellow(`Context · ${oneLine(context.label)}`)}\n${debugPreview(text)}`
+  }
+  if (density === 'normal' && (context.form === 'relay' || context.form === 'opaque')) {
+    const preview = oneLine(text)
+    if (preview !== '' && preview !== summary) return dim(`◇ ${summary} · ${preview}`)
+  }
+  return dim(`◇ ${summary}`)
+}
+
+function formatSystem(entry: TranscriptEntry, text: string, density: TranscriptDensity): string | undefined {
+  if (entry.error) {
+    const detail = density === 'debug'
+      ? debugPreview(text)
+      : tailPreview(text, ERROR_DETAIL_LINES, ERROR_DETAIL_CHARS)
+    return `${red('✗')} ${detail}`
+  }
+  if (density === 'debug') return `${yellow('System')}\n${debugPreview(text)}`
+  if (entry.systemKind === 'routine') return undefined
+  if (entry.systemKind === 'todo') {
+    return density === 'compact' ? undefined : dim(entry.systemSummary ?? 'Todos updated')
+  }
+  return `${yellow('◇')} ${oneLine(entry.systemSummary ?? text)}`
+}
+
+export function formatEntry(entry: TranscriptEntry, density: TranscriptDensity = 'normal'): string | undefined {
   const text = sanitizeTerminalText(entry.text)
-  if (entry.kind === 'reasoning') {
-    return `${dim('Thinking')}\n${dim(text || '…')}`
-  }
-  if (entry.kind === 'tool') {
-    const mark = entry.error ? red('✗') : entry.streaming ? yellow('◆') : green('✓')
-    const detail = entry.detail === undefined ? undefined : sanitizeTerminalText(entry.detail).trim()
-    const diff = renderDiffs(entry.diffs)
-    return `${mark} ${bold(text)}${detail ? `\n\n\`\`\`text\n${detail}\n\`\`\`` : ''}${diff ? `\n\n${diff}` : ''}`
-  }
+  if (entry.kind === 'reasoning') return formatReasoning(entry, text, density)
+  if (entry.kind === 'tool') return formatTool(entry, text, density)
   if (entry.role === 'user') return `${deepseekBlue('You')}\n${text}`
-  if (entry.role === 'system') return `${yellow('System')}\n${text}`
+  if (entry.context !== undefined) return formatContext(entry, text, density)
+  if (entry.role === 'system') return formatSystem(entry, text, density)
   return text || '…'
+}
+
+class TranscriptRow implements Component {
+  private content?: string
+  private markdown?: Markdown
+
+  setContent(content: string | undefined): void {
+    if (content === this.content) return
+    this.content = content
+    if (content === undefined) {
+      this.markdown = undefined
+      return
+    }
+    if (this.markdown === undefined) {
+      this.markdown = new Markdown(content, 1, 1, markdownTheme, undefined, { renderLatex: true })
+    }
+    else this.markdown.setText(content)
+  }
+
+  invalidate(): void {
+    this.markdown?.invalidate()
+  }
+
+  render(width: number): string[] {
+    return this.markdown?.render(width) ?? []
+  }
 }
 
 export class StatusLine implements Component {
@@ -484,8 +673,10 @@ export class DeepSeekTui {
   private readonly interactionHost = new Container()
   private readonly scroll: ScrollView
   private readonly status = new StatusLine()
-  private readonly components = new Map<string, Markdown>()
+  private readonly components = new Map<string, TranscriptRow>()
+  private readonly projectedEntries = new Map<string, TranscriptEntry>()
   private projectionIds = new Set<string>()
+  private transcriptDensity: TranscriptDensity = 'normal'
   private sessionId?: string
   private projection?: ProjectionState
   private callbacks?: TuiCallbacks
@@ -523,6 +714,17 @@ export class DeepSeekTui {
   setSlashCommands(commands: readonly SlashCommand[], cwd: string): void {
     this.autocomplete = createCommandAutocomplete(commands, cwd)
     if (this.pendingText === undefined) this.editor.setAutocompleteProvider(this.autocomplete)
+  }
+
+  setTranscriptDensity(density: TranscriptDensity): void {
+    if (density === this.transcriptDensity) return
+    this.transcriptDensity = density
+    if (this.projection !== undefined) {
+      for (const entry of this.projection.entries) {
+        this.components.get(entry.id)?.setContent(formatEntry(entry, density))
+      }
+    }
+    this.tui.requestRender()
   }
 
   start(callbacks: TuiCallbacks): void {
@@ -599,15 +801,21 @@ export class DeepSeekTui {
       const component = this.components.get(id)
       if (component !== undefined) this.transcript.removeChild(component)
       this.components.delete(id)
+      this.projectedEntries.delete(id)
     }
     for (const entry of state.entries) {
       const existing = this.components.get(entry.id)
       if (existing !== undefined) {
-        existing.setText(formatEntry(entry))
+        if (this.projectedEntries.get(entry.id) !== entry) {
+          existing.setContent(formatEntry(entry, this.transcriptDensity))
+          this.projectedEntries.set(entry.id, entry)
+        }
         continue
       }
-      const component = this.markdown(formatEntry(entry))
+      const component = new TranscriptRow()
+      component.setContent(formatEntry(entry, this.transcriptDensity))
       this.components.set(entry.id, component)
+      this.projectedEntries.set(entry.id, entry)
       this.transcript.addChild(component)
     }
     this.projectionIds = nextIds
@@ -616,7 +824,8 @@ export class DeepSeekTui {
   }
 
   appendNotice(text: string): void {
-    const source = `${yellow('System')}\n${sanitizeTerminalText(text)}`
+    const safe = sanitizeTerminalText(text)
+    const source = safe.includes('\n') ? `${yellow('Notice')}\n${safe}` : `${yellow('Notice')} · ${safe}`
     this.transcript.addChild(this.markdown(source))
     this.tui.requestRender()
   }
@@ -830,6 +1039,7 @@ export class DeepSeekTui {
     this.sessionId = sessionId
     this.transcript.clear()
     this.components.clear()
+    this.projectedEntries.clear()
     this.projectionIds.clear()
     this.projection = undefined
     this.scroll.scrollToEnd()

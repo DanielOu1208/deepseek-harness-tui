@@ -1,5 +1,6 @@
 import { Editor, TuiAltScreen, type Component, type AutocompleteProvider, type SelectItem, type SlashCommand, type Terminal } from '@earendil-works/pi-tui';
 import type { ProjectionState, TranscriptEntry } from './projection.js';
+import type { TranscriptDensity } from './transcript-settings.js';
 /**
  * Remove terminal control strings supplied by models, tools, files, or plugins.
  * Newlines and tabs remain available to Markdown; raw CSI/OSC/DCS/APC/PM/SOS
@@ -20,7 +21,7 @@ export declare class CtrlCExitGate {
 }
 export declare function createCommandAutocomplete(commands: readonly SlashCommand[], cwd: string): AutocompleteProvider;
 export declare function renderLaunchBanner(sessionId: string, cwd: string): string;
-export declare function formatEntry(entry: TranscriptEntry): string;
+export declare function formatEntry(entry: TranscriptEntry, density?: TranscriptDensity): string | undefined;
 export declare class StatusLine implements Component {
     private state?;
     private note;
@@ -55,7 +56,9 @@ export declare class DeepSeekTui {
     private readonly scroll;
     private readonly status;
     private readonly components;
+    private readonly projectedEntries;
     private projectionIds;
+    private transcriptDensity;
     private sessionId?;
     private projection?;
     private callbacks?;
@@ -66,6 +69,7 @@ export declare class DeepSeekTui {
     private started;
     constructor(terminal?: Terminal);
     setSlashCommands(commands: readonly SlashCommand[], cwd: string): void;
+    setTranscriptDensity(density: TranscriptDensity): void;
     start(callbacks: TuiCallbacks): void;
     stop(): void;
     renderProjection(state: ProjectionState): void;

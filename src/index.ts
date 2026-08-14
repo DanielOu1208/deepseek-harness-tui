@@ -15,7 +15,7 @@ import type {} from '@deepseek-ai/dsh-commands'
 import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { PERMISSION_SETTINGS_NAMESPACE } from '@deepseek-ai/dsh-permission-presets'
 import type {} from '@deepseek-ai/dsh-session-persistence'
-import type {} from '@deepseek-ai/dsh-settings'
+import type { SettingsScope } from '@deepseek-ai/dsh-settings'
 import type { ToolResult } from '@deepseek-ai/dsh-tools'
 import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
@@ -46,6 +46,14 @@ import {
 } from './interaction.js'
 import { createProjection, foldSessionEvent, type ProjectionState, type ToolPresenter } from './projection.js'
 import type { TuiStartupOptions } from './startup.js'
+import {
+  DEFAULT_TRANSCRIPT_DENSITY,
+  TRANSCRIPT_DENSITY_PICKER_ITEMS,
+  TRANSCRIPT_SETTINGS_NAMESPACE,
+  TRANSCRIPT_SETTINGS_SCHEMA,
+  type TranscriptDensity,
+  type TranscriptSettings,
+} from './transcript-settings.js'
 import { DeepSeekTui, sanitizeTerminalText } from './ui.js'
 
 export const name = 'dsh-tui-runner'
@@ -100,12 +108,25 @@ export class DshTuiRunner {
   private projectionCursor = 0
   private closing = false
   private started = false
+  private localTranscriptDensity: TranscriptDensity = DEFAULT_TRANSCRIPT_DENSITY
 
   constructor(
     private readonly ctx: Context,
     private readonly startup: TuiStartupOptions,
     private readonly ui = new DeepSeekTui(),
-  ) {}
+    private readonly transcriptSettings?: SettingsScope<TranscriptSettings>,
+  ) {
+    if (this.transcriptSettings !== undefined) {
+      this.ui.setTranscriptDensity(this.transcriptSettings.get().transcriptDensity)
+      this.interactionDisposers.push(this.transcriptSettings.watch(next => {
+        this.ui.setTranscriptDensity(next.transcriptDensity)
+      }))
+    }
+  }
+
+  private get transcriptDensity(): TranscriptDensity {
+    return this.transcriptSettings?.get().transcriptDensity ?? this.localTranscriptDensity
+  }
 
   private get agent(): Agent {
     if (this.handle === undefined) throw new Error('no active DeepSeek session')
@@ -679,6 +700,7 @@ export class DshTuiRunner {
       `- Current reasoning: ${current?.reasoningEffort ?? 'model default'}`,
       `- Current permission: ${currentPermission}`,
       `- Busy Enter: ${this.busyEnter}`,
+      `- Transcript detail: ${this.transcriptDensity}`,
       `- New-session model: ${defaults.provider}/${defaults.model}`,
       `- New-session reasoning: ${defaults.reasoningEffort ?? 'model default'}`,
       `- New-session permission: ${this.ctx.permissionPresets.defaultPreset}`,
@@ -757,6 +779,7 @@ export class DshTuiRunner {
       reasoning: current?.reasoningEffort ?? 'model default',
       permission,
       busy: this.busyEnter,
+      'transcript-density': this.transcriptDensity,
       'save-model-default': `${defaults.provider}/${defaults.model}`,
       'save-permission-default': this.ctx.permissionPresets.defaultPreset,
       advanced: `${this.ctx.settings.describe({ redactSecrets: true }).length} namespaces`,
@@ -790,6 +813,7 @@ export class DshTuiRunner {
       case 'reasoning': await this.selectReasoning(''); return
       case 'permission': await this.choosePermission(); return
       case 'busy': await this.selectBusyEnter(''); return
+      case 'transcript-density': await this.selectTranscriptDensity(); return
       case 'advanced': await this.editAdvancedSettings(); return
       case 'save-model-default': {
         const current = this.selection?.current
@@ -814,6 +838,21 @@ export class DshTuiRunner {
       }
       default: await this.editAdvancedSettings(action); return
     }
+  }
+
+  private async selectTranscriptDensity(): Promise<void> {
+    const choice = await this.ui.choose('Transcript detail', [...TRANSCRIPT_DENSITY_PICKER_ITEMS], undefined, {
+      initialValue: this.transcriptDensity,
+    })
+    if (choice === undefined) return
+    const density = choice.value as TranscriptDensity
+    if (this.transcriptSettings === undefined) {
+      this.localTranscriptDensity = density
+      this.ui.setTranscriptDensity(density)
+    } else {
+      await this.transcriptSettings.update({ transcriptDensity: density })
+    }
+    this.ui.appendNotice(`Transcript detail set to ${choice.label}.`)
   }
 
   private async pauseAndExit(): Promise<void> {
@@ -843,7 +882,12 @@ export class DshTuiRunner {
 export function apply(ctx: Context): void {
   const startup = ctx.get('dshTuiStartup')
   if (startup === undefined) throw new Error('dsh-tui: missing startup options')
-  const runner = new DshTuiRunner(ctx, startup)
+  const transcriptSettings = ctx.settings.register(
+    TRANSCRIPT_SETTINGS_NAMESPACE,
+    TRANSCRIPT_SETTINGS_SCHEMA,
+    { applies: 'live' },
+  )
+  const runner = new DshTuiRunner(ctx, startup, undefined, transcriptSettings)
   ctx.effect(() => {
     void runner.start().catch((error: unknown) => {
       runner.shutdown(false).catch(() => {})
@@ -857,3 +901,12 @@ export function apply(ctx: Context): void {
 
 export { DeepSeekTui } from './ui.js'
 export { projectSession } from './projection.js'
+export {
+  DEFAULT_TRANSCRIPT_DENSITY,
+  TRANSCRIPT_DENSITIES,
+  TRANSCRIPT_DENSITY_PICKER_ITEMS,
+  TRANSCRIPT_SETTINGS_NAMESPACE,
+  TRANSCRIPT_SETTINGS_SCHEMA,
+  type TranscriptDensity,
+  type TranscriptSettings,
+} from './transcript-settings.js'

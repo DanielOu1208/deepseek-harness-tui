@@ -80,6 +80,7 @@ Inside the TUI:
 - Up/Down and Enter operate menus; Space toggles checkbox answers.
 - `/` opens Harness commands.
 - `@` opens file completion.
+- Transcript detail defaults to Normal and can be changed from F2 → Transcript detail.
 
 Unknown slash commands are offered to the official Harness command service. Their availability depends on the composed profile.
 
@@ -98,6 +99,16 @@ Common local commands:
 | `/exit` | Flush and exit |
 
 The old singular `/setting` spelling remains accepted for compatibility, but is hidden from completion and help.
+
+### Transcript detail
+
+The TUI keeps user prompts and assistant answers readable while reducing internal transcript noise:
+
+- **Compact** shows one-line context and tool activity.
+- **Normal** adds structured tool outcomes and short previews where useful.
+- **Debug** shows bounded reasoning, injected context, tool output, and routine runtime events.
+
+The selected mode is saved globally in the Harness `dsh-tui` settings namespace and applies live. It changes only terminal presentation: model context and durable session events remain unchanged. Debug output still has rendering safety limits; the persisted Harness session remains the authoritative source for larger raw content.
 
 ## Update
 
