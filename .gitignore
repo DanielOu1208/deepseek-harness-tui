@@ -1,0 +1,10 @@
+node_modules/
+coverage/
+.integration-home
+*.tgz
+.env
+.env.*
+!.env.example
+.credentials.yaml
+.DS_Store
+*.log

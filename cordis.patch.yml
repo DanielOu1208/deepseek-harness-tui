@@ -1,0 +1,17 @@
+# Keep module HMR away from raw-mode terminal ownership.
+- id: hmr
+  disabled: true
+
+- insert:
+    # The base bundle exposes the question service but intentionally does not
+    # mount its model-facing tool. A TUI has a real human answerer, so add it.
+    - id: tui-ask-user-tool
+      name: '@deepseek-ai/dsh-tool-ask-user'
+
+    # Parse this profile's CLI before starting terminal raw mode.
+    - id: tui-startup
+      name: '@chalk/dsh-tui/startup'
+
+    - id: tui-runner
+      name: '@chalk/dsh-tui'
+      inject: [dshTuiStartup]
