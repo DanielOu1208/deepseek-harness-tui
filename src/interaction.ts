@@ -99,6 +99,32 @@ export interface ReasoningPickerSource {
   defaultEffort?: string
 }
 
+export type ReasoningStepDirection = 'increase' | 'decrease'
+
+export type ReasoningStepResult =
+  | { kind: 'change'; effort: string }
+  | { kind: 'boundary'; effort: string }
+  | { kind: 'unavailable'; reason: 'no-efforts' | 'unknown-default' | 'unknown-current' }
+
+export function stepReasoningEffort(
+  reasoning: ReasoningPickerSource,
+  currentEffort: string | undefined,
+  direction: ReasoningStepDirection,
+): ReasoningStepResult {
+  if (reasoning.efforts.length === 0) return { kind: 'unavailable', reason: 'no-efforts' }
+  const effective = currentEffort ?? reasoning.defaultEffort
+  if (effective === undefined) return { kind: 'unavailable', reason: 'unknown-default' }
+  const currentIndex = reasoning.efforts.findIndex(effort => effort.id === effective)
+  if (currentIndex < 0) {
+    const reason = currentEffort === undefined ? 'unknown-default' : 'unknown-current'
+    return { kind: 'unavailable', reason }
+  }
+  const delta = direction === 'increase' ? 1 : -1
+  const nextIndex = Math.max(0, Math.min(reasoning.efforts.length - 1, currentIndex + delta))
+  const effort = reasoning.efforts[nextIndex]!.id
+  return nextIndex === currentIndex ? { kind: 'boundary', effort } : { kind: 'change', effort }
+}
+
 export function reasoningPickerItems(reasoning: ReasoningPickerSource): PickerItem[] {
   const defaultName = reasoning.efforts.find(effort => effort.id === reasoning.defaultEffort)?.name
   return [

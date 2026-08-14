@@ -18,6 +18,7 @@ import {
   reasoningPickerItems,
   sessionPickerItems,
   settingsNamespacePickerItems,
+  stepReasoningEffort,
 } from '../src/interaction.js'
 
 test('parses provider/model while preserving slashes in model ids', () => {
@@ -107,6 +108,35 @@ test('builds reasoning and busy-behavior picker choices', () => {
     SETTINGS_PICKER_ITEMS.find(item => item.value === 'transcript-density'),
     { value: 'transcript-density', label: 'Transcript detail', description: 'Choose how much transcript detail to show' },
   )
+})
+
+test('steps through actual reasoning levels from the effective model default and stops at boundaries', () => {
+  const reasoning = {
+    efforts: [
+      { id: 'off', name: 'Off' },
+      { id: 'high', name: 'High' },
+      { id: 'max', name: 'Max' },
+    ],
+    defaultEffort: 'high',
+  }
+  assert.deepEqual(stepReasoningEffort(reasoning, undefined, 'increase'), { kind: 'change', effort: 'max' })
+  assert.deepEqual(stepReasoningEffort(reasoning, undefined, 'decrease'), { kind: 'change', effort: 'off' })
+  assert.deepEqual(stepReasoningEffort(reasoning, 'max', 'increase'), { kind: 'boundary', effort: 'max' })
+  assert.deepEqual(stepReasoningEffort(reasoning, 'off', 'decrease'), { kind: 'boundary', effort: 'off' })
+})
+
+test('does not guess when reasoning capabilities omit the current effective level', () => {
+  assert.deepEqual(stepReasoningEffort({ efforts: [] }, undefined, 'increase'), {
+    kind: 'unavailable', reason: 'no-efforts',
+  })
+  assert.deepEqual(stepReasoningEffort({ efforts: [{ id: 'high', name: 'High' }] }, undefined, 'increase'), {
+    kind: 'unavailable', reason: 'unknown-default',
+  })
+  assert.deepEqual(stepReasoningEffort({
+    efforts: [{ id: 'high', name: 'High' }], defaultEffort: 'high',
+  }, 'legacy', 'decrease'), {
+    kind: 'unavailable', reason: 'unknown-current',
+  })
 })
 
 test('builds redaction-safe advanced settings choices', () => {

@@ -482,6 +482,29 @@ test('captures the complete model selection for status and settings', () => {
   )
 })
 
+test('tracks the latest model route and advertised context capacity', () => {
+  let state = createProjection('s')
+  state = foldSessionEvent(state, {
+    seq: 1,
+    time: 1,
+    type: 'request/context',
+    data: { provider: 'deepseek-official', model: 'deepseek-v4-flash', contextWindow: 1_000_000 },
+  })
+  assert.deepEqual(state.requestContext, {
+    provider: 'deepseek-official',
+    model: 'deepseek-v4-flash',
+    contextWindow: 1_000_000,
+  })
+
+  state = foldSessionEvent(state, {
+    seq: 2,
+    time: 2,
+    type: 'request/context',
+    data: { provider: 'custom', model: 'unknown-capacity' },
+  })
+  assert.deepEqual(state.requestContext, { provider: 'custom', model: 'unknown-capacity' })
+})
+
 test('keeps repeated plan, permission, and goal changes in chronological history', () => {
   let state = createProjection('session-1')
   state = foldSessionEvent(state, { seq: 1, time: 1, type: 'plan/mode', data: { active: true } })

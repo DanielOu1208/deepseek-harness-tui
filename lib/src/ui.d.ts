@@ -45,6 +45,8 @@ export interface SettingsChoice {
 export interface TuiCallbacks {
     onPrompt(text: string): void | Promise<void>;
     onSettings(): void | Promise<void>;
+    onTogglePlanMode?(): void | Promise<void>;
+    onReasoningStep?(direction: 'increase' | 'decrease'): void | Promise<void>;
     onInterrupt(): void | Promise<void>;
     onExit(): void | Promise<void>;
 }
@@ -76,6 +78,7 @@ export declare class DeepSeekTui {
     appendNotice(text: string): void;
     appendLaunchBanner(sessionId: string, cwd: string): void;
     setStatus(note: string): void;
+    flashStatus(note: string, durationMs?: number): void;
     flashError(error: unknown): void;
     choose(title: string, items: SelectItem[], signal?: AbortSignal, options?: ChooseOptions): Promise<SelectItem | undefined>;
     chooseMany(title: string, items: SelectItem[], signal?: AbortSignal, options?: ChooseOptions): Promise<SelectItem[] | undefined>;

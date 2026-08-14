@@ -20,6 +20,9 @@ export declare class DshTuiRunner {
     private closing;
     private started;
     private localTranscriptDensity;
+    private selectedContextWindow?;
+    private shortcutQueue;
+    private sessionGeneration;
     constructor(ctx: Context, startup: TuiStartupOptions, ui?: DeepSeekTui, transcriptSettings?: SettingsScope<TranscriptSettings> | undefined);
     private get transcriptDensity();
     private get agent();
@@ -31,6 +34,10 @@ export declare class DshTuiRunner {
     private bindAgent;
     private refreshSlashCommands;
     private refresh;
+    private resolveContextWindow;
+    private enqueueShortcut;
+    private togglePlanMode;
+    private stepReasoning;
     submit(raw: string): Promise<void>;
     private runHarnessCommand;
     interrupt(): void;

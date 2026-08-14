@@ -77,10 +77,14 @@ Inside the TUI:
 - Ctrl+C closes an open panel and stops the active turn; press it again to exit.
 - Ctrl+D exits when the prompt is empty.
 - F2 opens the settings list.
+- Shift+Tab switches between plan and build mode. During an active turn, the Harness applies the switch at the next safe model step.
+- Shift+Up and Shift+Down raise or lower the reasoning effort for the next model request. The shortcut stops at the highest and lowest advertised levels.
 - Up/Down and Enter operate menus; Space toggles checkbox answers.
 - `/` opens Harness commands.
 - `@` opens file completion.
 - Transcript detail defaults to Normal and can be changed from F2 → Transcript detail.
+
+The footer shows approximate context occupancy against the active model's capacity, for example `ctx ~42K/1M (4%)`. The estimate describes the next prompt rather than billing usage and updates immediately after compaction. Before the first provider usage sample, the footer shows the known capacity as `ctx —/1M`.
 
 Unknown slash commands are offered to the official Harness command service. Their availability depends on the composed profile.
 

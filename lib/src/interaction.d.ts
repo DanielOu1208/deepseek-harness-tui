@@ -40,6 +40,18 @@ export interface ReasoningPickerSource {
     }>;
     defaultEffort?: string;
 }
+export type ReasoningStepDirection = 'increase' | 'decrease';
+export type ReasoningStepResult = {
+    kind: 'change';
+    effort: string;
+} | {
+    kind: 'boundary';
+    effort: string;
+} | {
+    kind: 'unavailable';
+    reason: 'no-efforts' | 'unknown-default' | 'unknown-current';
+};
+export declare function stepReasoningEffort(reasoning: ReasoningPickerSource, currentEffort: string | undefined, direction: ReasoningStepDirection): ReasoningStepResult;
 export declare function reasoningPickerItems(reasoning: ReasoningPickerSource): PickerItem[];
 export declare const BUSY_PICKER_ITEMS: readonly PickerItem[];
 export declare const SETTINGS_PICKER_ITEMS: readonly PickerItem[];

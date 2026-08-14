@@ -11,6 +11,7 @@ import {
   Text,
   TuiAltScreen,
   VStack,
+  isKeyRelease,
   matchesKey,
   truncateToWidth,
   visibleWidth,
@@ -38,7 +39,10 @@ const yellow = ansi('33')
 const red = ansi('31')
 const green = ansi('32')
 const magenta = ansi('35')
-const BANNER_CONTROLS = '/ commands · @ files · F2 settings · Ctrl+C stop / ×2 exit · Ctrl+D exit · /help'
+const BANNER_CONTROLS = [
+  '/ commands · @ files · F2 settings · Ctrl+C stop / ×2 exit · Ctrl+D exit · /help',
+  'Shift+Tab plan/build · Shift+↑/↓ reasoning',
+].join('\n')
 const SUMMARY_MAX_CHARS = 120
 const NORMAL_REASONING_LINES = 3
 const NORMAL_REASONING_CHARS = 600
@@ -483,6 +487,28 @@ class TranscriptRow implements Component {
   }
 }
 
+function formatScaledTokens(value: number): string {
+  return value >= 100 ? String(Math.round(value)) : String(Math.round(value * 10) / 10)
+}
+
+function formatTokens(value: number): string {
+  if (value < 1_000) return String(value)
+  if (value < 1_000_000) return `${formatScaledTokens(value / 1_000)}K`
+  return `${formatScaledTokens(value / 1_000_000)}M`
+}
+
+function formatContextWindow(
+  context: NonNullable<ProjectionState['contextWindow']>,
+  compact: boolean,
+): string {
+  const capacity = formatTokens(context.capacityTokens)
+  const used = context.usedTokens === undefined ? '—' : `~${formatTokens(context.usedTokens)}`
+  if (compact) return `c:${used}/${capacity}`
+  if (context.usedTokens === undefined) return `ctx ${used}/${capacity}`
+  const percent = Math.min(100, Math.round(context.usedTokens / context.capacityTokens * 100))
+  return `ctx ${used}/${capacity} (${String(percent)}%)`
+}
+
 export class StatusLine implements Component {
   private state?: ProjectionState
   private note = ''
@@ -532,7 +558,11 @@ export class StatusLine implements Component {
     const scroll = followingOutput
       ? undefined
       : yellow(compactPrimary ? 'End↑' : 'history ↑ · End to latest')
-    const fixedPrimary = [activity, reasoning, mode, permission, ...(scroll === undefined ? [] : [scroll])]
+    const contextWindow = state.contextWindow
+    const context = contextWindow === undefined || width < 55
+      ? undefined
+      : deepseekBlue(formatContextWindow(contextWindow, compactPrimary))
+    const fixedPrimary = [activity, reasoning, mode, permission, ...(context === undefined ? [] : [context]), ...(scroll === undefined ? [] : [scroll])]
     const modelBudget = Math.max(
       3,
       width - fixedPrimary.reduce((total, segment) => total + visibleWidth(segment), 0)
@@ -545,7 +575,7 @@ export class StatusLine implements Component {
       : 'model unavailable'
     const modelText = truncateToWidth(rawModel, modelBudget, '…')
     const model = state.provider && state.model ? deepseekBlue(modelText) : dim(modelText)
-    const primary = [model, reasoning, mode, permission, activity, ...(scroll === undefined ? [] : [scroll])]
+    const primary = [model, reasoning, mode, permission, ...(context === undefined ? [] : [context]), activity, ...(scroll === undefined ? [] : [scroll])]
     let output = primary.join(separator)
 
     const tools = state.activeTools.length > 0
@@ -563,7 +593,7 @@ export class StatusLine implements Component {
     const note = this.note === '' || this.note === 'ready'
       ? undefined
       : this.note.startsWith('error:') ? red(this.note) : dim(this.note)
-    for (const segment of [tools, retry, session, usage, goal, todos, note]) {
+    for (const segment of [tools, retry, usage, session, goal, todos, note]) {
       if (segment === undefined) continue
       const candidate = `${output}${separator}${segment}`
       if (visibleWidth(candidate) <= width) output = candidate
@@ -662,6 +692,8 @@ interface PendingText {
 export interface TuiCallbacks {
   onPrompt(text: string): void | Promise<void>
   onSettings(): void | Promise<void>
+  onTogglePlanMode?(): void | Promise<void>
+  onReasoningStep?(direction: 'increase' | 'decrease'): void | Promise<void>
   onInterrupt(): void | Promise<void>
   onExit(): void | Promise<void>
 }
@@ -746,6 +778,33 @@ export class DeepSeekTui {
       void Promise.resolve(callbacks.onPrompt(text)).catch(error => this.flashError(error))
     }
     this.tui.addInputListener((data) => {
+      const togglePlan = matchesKey(data, Key.shift(Key.tab))
+      let reasoningDirection: 'increase' | 'decrease' | undefined
+      if (matchesKey(data, Key.shift(Key.up))) reasoningDirection = 'increase'
+      else if (matchesKey(data, Key.shift(Key.down))) reasoningDirection = 'decrease'
+      if (togglePlan || reasoningDirection !== undefined) {
+        if (isKeyRelease(data)) return { consume: true }
+        this.ctrlCExit.reset()
+        if (this.activeInteraction !== undefined) {
+          this.tui.flash('Finish the current dialog before changing mode or reasoning.', 2500)
+          return { consume: true }
+        }
+        this.editor.handleInput('\u001b')
+        let shortcut: (() => void | Promise<void>) | undefined
+        if (togglePlan) {
+          shortcut = callbacks.onTogglePlanMode
+        } else if (callbacks.onReasoningStep !== undefined && reasoningDirection !== undefined) {
+          const direction = reasoningDirection
+          const onReasoningStep = callbacks.onReasoningStep
+          shortcut = () => onReasoningStep(direction)
+        }
+        if (shortcut === undefined) {
+          this.tui.flash('This shortcut is unavailable in the current profile.', 2500)
+        } else {
+          void Promise.resolve(shortcut()).catch(error => this.flashError(error))
+        }
+        return { consume: true }
+      }
       if (isSettingsShortcut(data)) {
         this.ctrlCExit.reset()
         if (this.activeInteraction === undefined) {
@@ -841,6 +900,10 @@ export class DeepSeekTui {
     this.status.setNote(note)
     if (this.projection !== undefined) this.status.update(this.projection, note)
     this.tui.requestRender()
+  }
+
+  flashStatus(note: string, durationMs = 2500): void {
+    this.tui.flash(sanitizeTerminalText(note), durationMs)
   }
 
   flashError(error: unknown): void {

@@ -62,6 +62,16 @@ export interface ProjectionState {
     provider?: string;
     model?: string;
     reasoningEffort?: string;
+    requestContext?: {
+        provider: string;
+        model: string;
+        contextWindow?: number;
+    };
+    contextUsageReady?: boolean;
+    contextWindow?: {
+        usedTokens?: number;
+        capacityTokens: number;
+    };
     lastError?: string;
 }
 export interface EventLike {

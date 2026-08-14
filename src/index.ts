@@ -12,6 +12,9 @@ import {
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type {} from '@deepseek-ai/dsh-cmdline'
 import type {} from '@deepseek-ai/dsh-commands'
+import type {} from '@deepseek-ai/dsh-plan-mode'
+import type {} from '@deepseek-ai/dsh-session-projection'
+import type {} from '@deepseek-ai/dsh-token-meter'
 import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { PERMISSION_SETTINGS_NAMESPACE } from '@deepseek-ai/dsh-permission-presets'
 import type {} from '@deepseek-ai/dsh-session-persistence'
@@ -41,8 +44,10 @@ import {
   reasoningPickerItems,
   sessionPickerItems,
   settingsNamespacePickerItems,
+  stepReasoningEffort,
   type ModelPickerSource,
   type PickerItem,
+  type ReasoningStepDirection,
 } from './interaction.js'
 import { createProjection, foldSessionEvent, type ProjectionState, type ToolPresenter } from './projection.js'
 import type { TuiStartupOptions } from './startup.js'
@@ -64,7 +69,10 @@ export const inject = [
   'sessions',
   'sessionPersistence',
   'commands',
+  'planMode',
   'permissionPresets',
+  'sessionProjections',
+  'tokenMeter',
   'settings',
   'tools',
   'llm',
@@ -109,6 +117,9 @@ export class DshTuiRunner {
   private closing = false
   private started = false
   private localTranscriptDensity: TranscriptDensity = DEFAULT_TRANSCRIPT_DENSITY
+  private selectedContextWindow?: number
+  private shortcutQueue: Promise<void> = Promise.resolve()
+  private sessionGeneration = 0
 
   constructor(
     private readonly ctx: Context,
@@ -145,6 +156,8 @@ export class DshTuiRunner {
     this.ui.start({
       onPrompt: text => this.submit(text),
       onSettings: () => this.chooseSettings(),
+      onTogglePlanMode: () => this.enqueueShortcut(() => this.togglePlanMode()),
+      onReasoningStep: direction => this.enqueueShortcut(() => this.stepReasoning(direction)),
       onInterrupt: () => this.interrupt(),
       onExit: () => this.shutdown(true),
     })
@@ -241,6 +254,7 @@ export class DshTuiRunner {
       selected = modelFromEvents(inspected.events, defaultSelection)
     }
     const selection: ModelSelectionRef = { current: selected, assembled: undefined }
+    this.selectedContextWindow = await this.resolveContextWindow(selected)
     const setup = (agentCtx: Context): void => { installModelSelection(agentCtx, selection) }
     const handle = resumeId === undefined
       ? await this.ctx.agents.create({
@@ -349,8 +363,103 @@ export class DshTuiRunner {
       state.provider = this.selection.current.provider
       state.model = this.selection.current.model
       state.reasoningEffort = this.selection.current.reasoningEffort
+      const requestContext = state.requestContext
+      const routeMatches = requestContext?.provider === this.selection.current.provider
+        && requestContext.model === this.selection.current.model
+      const capacityTokens = this.selectedContextWindow ?? (routeMatches ? requestContext?.contextWindow : undefined)
+      if (capacityTokens !== undefined) {
+        const pressure = this.ctx.sessionProjections.snapshot(this.agent.session).values.contextPressure
+        const usedTokens = routeMatches && state.contextUsageReady
+          ? pressure?.projectedTokens ?? pressure?.pressureTokens
+          : undefined
+        state.contextWindow = {
+          capacityTokens,
+          ...(usedTokens === undefined ? {} : { usedTokens }),
+        }
+      }
     }
     this.ui.renderProjection(state)
+  }
+
+  private async resolveContextWindow(selection: ModelSelection): Promise<number | undefined> {
+    try {
+      const info = await this.ctx.llm.resolveModelInfo(selection.provider, selection.model)
+      const contextWindow = info.context?.contextWindow
+      return typeof contextWindow === 'number' && Number.isInteger(contextWindow) && contextWindow > 0
+        ? contextWindow
+        : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  private enqueueShortcut(action: () => Promise<void>): Promise<void> {
+    const generation = this.sessionGeneration
+    const runIfCurrent = async (): Promise<void> => {
+      if (generation === this.sessionGeneration) await action()
+    }
+    const queued = this.shortcutQueue.then(runIfCurrent, runIfCurrent)
+    this.shortcutQueue = queued.catch(() => {})
+    return queued
+  }
+
+  private async togglePlanMode(): Promise<void> {
+    const handle = this.handle
+    if (handle === undefined) throw new Error('no active DeepSeek session')
+    const generation = this.sessionGeneration
+    const agent = handle.agent
+    const current = this.ctx.planMode.get(agent)
+    const target = !(current.pending ?? current.active)
+    await this.runHarnessCommand(target ? '/plan' : '/plan off', agent)
+    if (generation !== this.sessionGeneration || this.handle !== handle) return
+    const next = this.ctx.planMode.get(agent)
+    const selected = next.pending ?? next.active
+    this.ui.setStatus(next.pending === undefined
+      ? `${selected ? 'plan' : 'build'} mode`
+      : `${selected ? 'plan' : 'build'} mode queued for the next step`)
+  }
+
+  private async stepReasoning(direction: ReasoningStepDirection): Promise<void> {
+    const handle = this.handle
+    const selectionRef = this.selection
+    const generation = this.sessionGeneration
+    if (handle === undefined) throw new Error('no active DeepSeek session')
+    if (selectionRef === undefined) throw new Error('model selection is unavailable')
+    const selection = selectionRef.current
+    if (selection === undefined) throw new Error('model selection is unavailable')
+    const info = await this.ctx.llm.resolveModelInfo(selection.provider, selection.model)
+    if (generation !== this.sessionGeneration
+      || this.handle !== handle
+      || this.selection !== selectionRef
+      || selectionRef.current !== selection) return
+    if (info.reasoning === undefined) {
+      const status = 'reasoning is not configurable for the current model'
+      this.ui.setStatus(status)
+      this.ui.flashStatus(status)
+      return
+    }
+    const result = stepReasoningEffort(info.reasoning, selection.reasoningEffort, direction)
+    if (result.kind === 'unavailable') {
+      const status = result.reason === 'no-efforts'
+        ? 'reasoning is not configurable for the current model'
+        : 'the current reasoning level is unknown; use /reasoning'
+      this.ui.setStatus(status)
+      this.ui.flashStatus(status)
+      return
+    }
+    if (result.kind === 'boundary') {
+      const status = `reasoning is already at ${result.effort}`
+      this.ui.setStatus(status)
+      this.ui.flashStatus(status)
+      return
+    }
+    selectionRef.current = {
+      provider: selection.provider,
+      model: selection.model,
+      reasoningEffort: ReasoningEffortId(result.effort),
+    }
+    this.refresh()
+    this.ui.setStatus(`reasoning ${result.effort} · next request`)
   }
 
   async submit(raw: string): Promise<void> {
@@ -439,15 +548,21 @@ export class DshTuiRunner {
     }
   }
 
-  private async runHarnessCommand(line: string): Promise<void> {
+  private async runHarnessCommand(
+    line: string,
+    agent: Agent = this.agent,
+    generation = this.sessionGeneration,
+  ): Promise<void> {
     const abort = new AbortController()
-    const execution = await this.ctx.commands.execute(this.agent, line, abort.signal)
+    const execution = await this.ctx.commands.execute(agent, line, abort.signal)
     if (execution === undefined) {
-      const available = this.ctx.commands.list(this.agent).map(command => `/${command.name}`).join(', ')
-      this.ui.appendNotice(`Unknown Harness command: ${line}\nAvailable: ${available || 'none'}`)
+      if (generation === this.sessionGeneration && this.handle?.agent === agent) {
+        const available = this.ctx.commands.list(agent).map(command => `/${command.name}`).join(', ')
+        this.ui.appendNotice(`Unknown Harness command: ${line}\nAvailable: ${available || 'none'}`)
+      }
       return
     }
-    this.refresh()
+    if (generation === this.sessionGeneration && this.handle?.agent === agent) this.refresh()
   }
 
   interrupt(): void {
@@ -474,6 +589,7 @@ export class DshTuiRunner {
 
   private async detachCurrent(): Promise<void> {
     if (this.handle === undefined) return
+    this.sessionGeneration += 1
     this.agent.cancel({ kind: 'user' }, { keepInbox: true })
     await this.agent.whenIdle()
     await this.ctx.sessions.flush(this.agent.session)
@@ -483,6 +599,7 @@ export class DshTuiRunner {
     this.selection = undefined
     this.projection = undefined
     this.projectionCursor = 0
+    this.selectedContextWindow = undefined
     await handle.dispose()
   }
 
@@ -627,6 +744,7 @@ export class DshTuiRunner {
       }
     }
     this.selection.current = next
+    this.selectedContextWindow = info.context?.contextWindow
     this.ui.appendNotice(
       `Next request will use ${ref.provider}/${ref.model} · reasoning ${next.reasoningEffort ?? 'model default'}`,
     )

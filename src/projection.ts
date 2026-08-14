@@ -60,6 +60,9 @@ export interface ProjectionState {
   provider?: string
   model?: string
   reasoningEffort?: string
+  requestContext?: { provider: string; model: string; contextWindow?: number }
+  contextUsageReady?: boolean
+  contextWindow?: { usedTokens?: number; capacityTokens: number }
   lastError?: string
 }
 
@@ -488,6 +491,22 @@ export function foldSessionEvent(state: ProjectionState, event: EventLike, prese
         model: data?.header?.config?.model,
         reasoningEffort: data?.header?.config?.reasoningEffort,
       }
+    case 'request/context': {
+      if (typeof data?.provider !== 'string' || typeof data?.model !== 'string') return state
+      const contextWindow = Number(data.contextWindow)
+      const routeChanged = state.requestContext === undefined
+        || state.requestContext.provider !== data.provider
+        || state.requestContext.model !== data.model
+      return {
+        ...state,
+        requestContext: {
+          provider: data.provider,
+          model: data.model,
+          ...(Number.isInteger(contextWindow) && contextWindow > 0 ? { contextWindow } : {}),
+        },
+        ...(routeChanged ? { contextUsageReady: false } : {}),
+      }
+    }
     case 'user/message': {
       const text = textFromBlocks(data?.content)
       if (text === '') return state
@@ -506,7 +525,9 @@ export function foldSessionEvent(state: ProjectionState, event: EventLike, prese
     }
     case 'assistant/chunk': {
       const chunk = data?.chunk
-      if (chunk?.type === 'usage' && chunk.usage !== undefined) return { ...state, usage: chunk.usage as TokenUsage }
+      if (chunk?.type === 'usage' && chunk.usage !== undefined) {
+        return { ...state, usage: chunk.usage as TokenUsage, contextUsageReady: true }
+      }
       if (chunk?.type !== 'text-delta' && chunk?.type !== 'reasoning-delta') return state
       const kind = chunk.type === 'text-delta' ? 'text' : 'reasoning'
       const id = `assistant:${String(data.turn)}:${String(data.step)}:${kind}:${String(chunk.index)}`
@@ -523,7 +544,13 @@ export function foldSessionEvent(state: ProjectionState, event: EventLike, prese
     case 'assistant/message': {
       let entries = state.entries.filter(entry => !entry.id.startsWith(`assistant:${String(data?.turn)}:${String(data?.step)}:`))
       for (const entry of assistantBlockEntries(data)) entries = replaceEntry(entries, entry)
-      return { ...state, entries, ...(data?.usage === undefined ? {} : { usage: data.usage as TokenUsage }) }
+      return {
+        ...state,
+        entries,
+        ...(data?.usage === undefined
+          ? {}
+          : { usage: data.usage as TokenUsage, contextUsageReady: true }),
+      }
     }
     case 'tool/call': {
       const id = String(data?.callId ?? `call-${event.seq}`)
