@@ -1,340 +1,211 @@
 # DeepSeek Harness TUI
 
-A standalone terminal interaction plane for the **official [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)**, rendered with [`@earendil-works/pi-tui`](https://www.npmjs.com/package/@earendil-works/pi-tui).
+A standalone terminal UI for the **official [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)**, rendered with [`@earendil-works/pi-tui`](https://www.npmjs.com/package/@earendil-works/pi-tui).
 
-This package does **not** fork or replace the Harness. The official runtime still owns the agent loop, models, tools, permissions, sessions, checkpoints, compaction, goals, skills, MCP, and subagents. This repository only supplies a Cordis profile layer and terminal UI.
+This package does not fork or replace the Harness. The official runtime still owns the agent loop, models, tools, permissions, sessions, checkpoints, compaction, goals, skills, MCP, subagents, profiles, and credentials. This package adds the `deepseek` launcher, a Cordis profile bundle, and the terminal interaction layer.
 
-> **Status:** experimental MVP targeting DeepSeek Harness `0.1.0-rc.6`. The Harness is prerelease software, so keep the CLI and this plugin on matching versions.
-
-## Features
-
-- Full-screen terminal UI with a multiline editor and command completion
-- Streaming assistant text, reasoning, tool calls, results, usage, and todos
-- Approval prompts and `ask_user_question` interaction
-- Terminal control-sequence sanitization for model, tool, session, and plugin text
-- New, list, switch, and resume persisted sessions
-- Model and reasoning-effort selection
-- Official Harness slash commands, goals, plans, compaction, settings, and permissions
-- Queue or steer while an agent turn is active
-- `Ctrl+C` interruption and clean terminal teardown
-- Cooperative durable pause: cancel → wait for idle → flush → exit → resume by session ID
-
-## Architecture
-
-```text
-Official DeepSeek Harness runtime
-├── agent loop, models, tools, permissions
-├── sessions, checkpoints, goals, skills, MCP
-└── Cordis services
-          ↑
-   @chalk/dsh-tui
-          ↑
- @earendil-works/pi-tui
-```
-
-The durable DeepSeek session log is the source of truth. Session events are folded into a render-only projection for the TUI.
+> **Status:** experimental MVP pinned to DeepSeek Harness `0.1.0-rc.6`. Keep the launcher and profile bundle on matching versions while the Harness is prerelease software.
 
 ## Requirements
 
-- macOS, Linux, or Windows terminal
-- Node.js **22.19.0 or newer** (Node 24 is also tested)
-- Git
-- `pnpm` available on `PATH` because `dsh plugin` delegates package management to it
-- A DeepSeek API key for live model requests
+- Node.js 22.19 or newer
+- A DeepSeek API key
+- macOS, Linux, or Windows
 
-Check your environment:
+## Install
 
-```sh
-node --version
-pnpm --version
-dsh --version
-```
-
-## Quick start
-
-### 1. Install the official CLI and pnpm
+One global install supplies the launcher, the matching official Harness `0.1.0-rc.6` runtime, and this TUI bundle:
 
 ```sh
-npm install --global @deepseek-ai/dsh@0.1.0-rc.6 pnpm@11.21.0
+npm install --global --install-links github:DanielOu1208/deepseek-harness-tui
 ```
 
-If `npm` warns about the Node engine, upgrade Node before continuing.
+Keep `--install-links` in the command. For a GitHub source install it makes npm copy the package into the global prefix instead of leaving the launcher linked to npm's temporary checkout.
 
-### 2. Install this profile from GitHub
+Confirm the launcher without creating or changing Harness state:
 
 ```sh
-dsh plugin --profile tui add github:DanielOu1208/deepseek-harness-tui
+deepseek --version
+deepseek --help
 ```
 
-The first command initializes the `tui` profile if it does not exist and composes this bundle over the official `@deepseek-ai/dsh-base` runtime.
+The first ordinary `deepseek` launch creates or completes the official `tui` profile under `$DSH_HOME/profiles/tui` (normally `~/.dsh/profiles/tui`) through the official Harness profile APIs. Existing profile files and user patch layers are preserved.
 
-### 3. Configure the API key
+## Authenticate
 
-#### Temporary key for one shell session
-
-This avoids putting the key in a repository or shell-history command:
+Store a key with masked terminal input:
 
 ```sh
-printf 'DeepSeek API key: '
-read -s DEEPSEEK_API_KEY
-printf '\n'
-export DEEPSEEK_API_KEY
+deepseek auth
 ```
 
-Run the TUI from the workspace the agent should operate on:
+The key is written through the official Harness credential service. It uses `$DSH_HOME/.credentials.yaml` (normally `~/.dsh/.credentials.yaml`), enforces the Harness file-safety rules, and never prints the key.
+
+Check authentication without revealing the credential:
 
 ```sh
-cd /path/to/your/project
-dsh --profile tui
+deepseek auth status
 ```
 
-When finished:
+Remove a key stored by the Harness:
 
 ```sh
-unset DEEPSEEK_API_KEY
+deepseek auth logout
 ```
 
-#### Persistent Harness credential
+Logout asks for confirmation and defaults to keeping the credential.
 
-The official local credential provider reads `~/.dsh/.credentials.yaml` by default. If you set `DSH_HOME`, use `$DSH_HOME/.credentials.yaml` instead.
+An inherited `DEEPSEEK_API_KEY` takes precedence and is intentionally read-only. When it is present, `auth`, `auth status`, and `auth logout` explain that the environment is supplying the active key. Change or unset it in the shell, service, CI configuration, or other environment that launches `deepseek`; the launcher will not claim to overwrite or remove it.
+
+Keys inherited from project or user `.env` files are also reported with their source. `deepseek auth logout` will not claim to delete those files; remove the key from the reported `.env` source instead.
+
+## Run
 
 ```sh
-mkdir -p ~/.dsh
-chmod 700 ~/.dsh
-nano ~/.dsh/.credentials.yaml
+deepseek
+deepseek "explain this repository"
+deepseek --cwd /path/to/project
+deepseek --resume session-xxxxxxxx
 ```
 
-Add this YAML mapping with your real key:
+Arguments are forwarded unchanged to the official Harness `tui` profile. Standard input, standard output, standard error, termination signals, and the Harness exit status are carried through by the launcher.
 
-```yaml
-DEEPSEEK_API_KEY: "sk-your-key-here"
-```
+Inside the TUI:
 
-Then secure the file:
+- Enter submits a prompt.
+- Escape closes the current menu or question without stopping the agent.
+- Ctrl+C closes an open panel and stops the active turn; press it again to exit.
+- Ctrl+D exits when the prompt is empty.
+- F2 opens the settings list.
+- Up/Down and Enter operate menus; Space toggles checkbox answers.
+- `/` opens Harness commands.
+- `@` opens file completion.
 
-```sh
-chmod 600 ~/.dsh/.credentials.yaml
-```
+Unknown slash commands are offered to the official Harness command service. Their availability depends on the composed profile.
 
-Never commit `.credentials.yaml`, `.env`, or a real key. An inherited `DEEPSEEK_API_KEY` environment variable takes precedence over the credential file, so unset stale shell values if a newly stored key appears to have no effect.
-
-An OpenAI-compatible DeepSeek gateway can be selected separately:
-
-```sh
-export DEEPSEEK_BASE_URL="https://your-gateway.example/v1"
-```
-
-Omit it to use the public DeepSeek endpoint.
-
-### 4. Send a live test prompt
-
-Interactive:
-
-```sh
-dsh --profile tui
-```
-
-Start with an initial prompt:
-
-```sh
-dsh --profile tui "Reply exactly with LIVE_MODEL_OK"
-```
-
-Choose a working directory explicitly:
-
-```sh
-dsh --profile tui --cwd /path/to/project
-```
-
-Resume a persisted session:
-
-```sh
-dsh --profile tui --resume session-xxxxxxxx
-```
-
-## Controls
-
-| Input | Action |
-|---|---|
-| `Enter` | Submit the editor contents |
-| `/` or `Tab` | Browse and complete commands |
-| `F2` | Open settings |
-| `Ctrl+C` | Interrupt the active turn; press again to exit |
-| `Ctrl+D` | Exit when the editor is empty |
-
-## Local TUI commands
+Common local commands:
 
 | Command | Purpose |
 |---|---|
 | `/help` | Show local and official Harness commands |
-| `/new` | Start a fresh session |
-| `/sessions` | List persisted sessions |
-| `/resume [session-id]` | Select or directly resume a session |
-| `/models` | List available models |
-| `/model [provider/model]` | Select a model |
-| `/reasoning [effort]` | Select reasoning effort |
-| `/permission [mode]` | Select the official tool-permission preset |
-| `/busy [queue\|steer]` | Choose how plain input behaves while busy |
-| `/settings` | Open core TUI settings |
-| `/queue <prompt>` | Queue a separate follow-up turn |
-| `/steer <prompt>` | Steer the nearest active agent step |
-| `/stop` | Cancel the active turn but keep the TUI open |
-| `/pause` | Cancel, wait, flush, show the resume ID, and exit |
-| `/exit` | Flush and exit cleanly |
+| `/new`, `/resume` | Start or resume a session |
+| `/model`, `/reasoning` | Change the next model request |
+| `/permission` | Change tool access for this session |
+| `/settings` or F2 | Open the Pi-style settings list |
+| `/busy` | Choose queue or steer behavior while an agent is running |
+| `/stop` | Stop the active turn and keep the TUI open |
+| `/pause` | Stop, flush, print the resume ID, and exit |
+| `/exit` | Flush and exit |
 
-Unknown slash commands are offered to the official Harness command service. Availability depends on the composed base profile; common examples include `/compact`, `/goal`, `/plan`, and `/feedback`.
+The old singular `/setting` spelling remains accepted for compatibility, but is hidden from completion and help.
 
-## Pause and resume semantics
+## Update
 
-`/pause` is a **cooperative durable stop**, not process freezing. It:
+```sh
+npm install --global --install-links github:DanielOu1208/deepseek-harness-tui
+deepseek --version
+```
 
-1. Cancels active agent work while preserving queued inbox items.
-2. Waits for the official agent to become idle.
-3. Flushes the official session log.
-4. Disposes the handle and exits the TUI.
-5. Prints the official session ID for `--resume` or `/resume`.
+The launcher keeps the shipped Harness packages on the matching `0.1.0-rc.6` line. Updating the global package does not erase sessions, credentials, settings, or the user-owned profile patch.
 
-It cannot continue an HTTP stream or tool process at the exact machine instruction where it stopped. That would be unsafe for network state, locks, child processes, and tool side effects.
+## Uninstall
 
-## Install from a local checkout
+```sh
+npm uninstall --global @chalk/dsh-tui
+```
 
-Use this when developing or testing an unpublished change:
+Uninstalling the package leaves Harness user data under `$DSH_HOME` in place. Remove that directory only if you deliberately want to delete credentials, settings, profiles, and sessions too.
+
+## Local development
 
 ```sh
 git clone https://github.com/DanielOu1208/deepseek-harness-tui.git
 cd deepseek-harness-tui
 npm install
-npm run check
-
-dsh plugin --profile tui add .
-dsh --profile tui
-```
-
-The repository includes compiled `lib/` output so pnpm can install the package directly from GitHub without executing dependency build scripts. The explicit `npm run check` above rebuilds that output and runs all tests before linking a local checkout.
-
-## Updating or uninstalling
-
-Reinstall the current GitHub version:
-
-```sh
-dsh plugin --profile tui remove @chalk/dsh-tui
-dsh plugin --profile tui add github:DanielOu1208/deepseek-harness-tui
-```
-
-Remove the plugin while retaining the profile directory and its user configuration:
-
-```sh
-dsh plugin --profile tui remove @chalk/dsh-tui
-```
-
-## Development
-
-```sh
-npm install
 npm test
 npm run build
-npm run check
-npm run pack:check
+npm link
+deepseek --help
 ```
 
-Project structure:
+To exercise a packed build without touching the real Harness home, point `DSH_HOME` at a temporary directory and invoke the compiled launcher directly.
+
+## Architecture
 
 ```text
-cordis.patch.yml       official base-profile overlay
-src/startup.ts         profile CLI options
-src/index.ts           Harness lifecycle and interaction bridge
-src/projection.ts      pure session-event projection
-src/ui.ts              pi-tui terminal presentation
-src/commands.ts        local/official command routing
-src/interaction.ts     menus and input parsing
-tests/                 non-TTY unit tests
+deepseek launcher
+  -> official dsh profile boot (`tui`)
+    -> @deepseek-ai/dsh-base
+    -> @chalk/dsh-tui
+      -> pi-tui terminal interaction
 ```
+
+The bundle overlay is [`cordis.patch.yml`](cordis.patch.yml). It composes this startup parser and TUI runner over `@deepseek-ai/dsh-base`; it does not copy the Harness runtime into this repository.
 
 ## Troubleshooting
 
-### `pnpm not found on PATH`
+### `deepseek: command not found`
 
-Install it globally and retry:
+Reinstall with link copying enabled:
 
 ```sh
-npm install --global pnpm@11.21.0
+npm install --global --install-links github:DanielOu1208/deepseek-harness-tui
 ```
 
-### Peer-dependency warnings during plugin installation
-
-The current prerelease `dsh` profile layout may print peer warnings for Cordis/Harness services supplied by the official base bundle. The clean-profile smoke test for this repository produces that warning and then boots successfully. Do not install random peer versions manually; first verify the effective profile instead:
+Then inspect npm's global prefix:
 
 ```sh
-dsh --profile tui --dump-config
+npm config get prefix
 ```
 
-The bundle stack should contain `@deepseek-ai/dsh-base` and `@chalk/dsh-tui`.
+On macOS and Linux, the `bin` directory inside that prefix must be on `PATH`. Start a new shell after changing `PATH`, or run `hash -r` to clear an older command lookup.
 
-### `MISSING_CREDENTIAL`
+### `deepseek auth` says an environment credential is read-only
 
-The process could not resolve `DEEPSEEK_API_KEY`. Check only whether it exists—do not print its value:
+Run:
 
 ```sh
-if [ -n "${DEEPSEEK_API_KEY:-}" ]; then echo 'key is set'; else echo 'key is missing'; fi
+deepseek auth status
 ```
 
-For the persistent store, confirm permissions:
+If it reports `env (read-only)`, unset `DEEPSEEK_API_KEY` in the environment that launches the process. A stored credential cannot override the inherited environment by design.
+
+### Credential file permissions
+
+On POSIX systems, the official provider rejects a credential file readable by group or other users:
 
 ```sh
-chmod 700 ~/.dsh
-chmod 600 ~/.dsh/.credentials.yaml
-```
-
-Restart the TUI after changing an environment-sourced key. The managed credential file itself is hot-reloaded by the official Harness.
-
-### Authentication or quota errors
-
-- `AUTH`: the key was rejected; replace it and retry.
-- `QUOTA`: the account has exhausted its balance or credits.
-- `RATE_LIMIT`: wait and retry; the official runtime owns bounded step retries.
-
-### Profile/plugin version mismatch
-
-This MVP pins DeepSeek Harness `0.1.0-rc.6`. Confirm the CLI:
-
-```sh
-dsh --version
-```
-
-If it differs, install the matching CLI shown in this README and reinstall the profile.
-
-### Broken terminal after a crash
-
-The TUI normally restores terminal state. If the process is force-killed and your shell looks wrong, run:
-
-```sh
-reset
+chmod 700 "${DSH_HOME:-$HOME/.dsh}"
+chmod 600 "${DSH_HOME:-$HOME/.dsh}/.credentials.yaml"
 ```
 
 ### Inspect the composed profile
 
+The standalone launcher forwards application arguments, while official launcher-level diagnostics remain available through the bundled `dsh` executable. For development inspection:
+
 ```sh
-dsh --profile tui --dump-config
+deepseek --dump-config
 ```
 
-You should see both `@deepseek-ai/dsh-base` and `@chalk/dsh-tui` in the effective bundle stack.
+The bundle stack should contain `@deepseek-ai/dsh-base` and `@chalk/dsh-tui`.
 
-## Security notes
+### Reset only the TUI profile
+
+Move `$DSH_HOME/profiles/tui` aside and run `deepseek` again. The launcher will initialize a clean profile on the next state-changing launch. Credentials and sessions live outside that profile directory.
+
+### Safety notes
 
 - Never put credentials in this repository, prompts, screenshots, issues, or terminal logs.
-- The default Harness permission mode is `workspace-write`; review approval prompts before allowing actions.
-- The local credential document is protected from other OS users by file mode, but agent tools run as your user. File permissions alone are not an isolation boundary from same-user processes.
-- Session telemetry is disabled by default in the official base profile unless you explicitly enable it.
+- `deepseek --help` and `deepseek --version` do not initialize a profile or open credential storage.
+- Credential file permissions protect against other OS users, not processes already running as your user.
+- Session telemetry remains controlled by the official base profile and is disabled by default unless explicitly enabled.
 
-## License
-
-MIT © 2026 Daniel Ou.
-
-## Upstream
-
-This is an independent community interaction plane and is not an official DeepSeek release.
+## Upstream references
 
 - [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 - [DeepSeek Harness CLI reference](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/cli/reference/README.md)
-- [DeepSeek credential provider reference](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/credentials/credentials-local/README.md)
-- [DeepSeek LLM adapter reference](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/llm/llm-deepseek/README.md)
+- [DeepSeek credential provider](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/credentials/credentials-local/README.md)
+
+## License
+
+MIT. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

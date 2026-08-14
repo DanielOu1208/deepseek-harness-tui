@@ -12,8 +12,16 @@ jobs:
   test:
     strategy:
       matrix:
-        node: [22.19.0, 24]
-    runs-on: ubuntu-latest
+        include:
+          - os: ubuntu-latest
+            node: 22.19.0
+          - os: ubuntu-latest
+            node: 24
+          - os: macos-latest
+            node: 24
+          - os: windows-latest
+            node: 24
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v7
@@ -24,4 +32,8 @@ jobs:
       - run: npm run check
       - name: Verify committed build output
         run: git diff --exit-code -- lib
+      - name: Smoke launcher entrypoint
+        run: |
+          node lib/src/bin.js --help
+          node lib/src/bin.js --version
       - run: npm run pack:check

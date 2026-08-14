@@ -3,10 +3,39 @@ export interface ModelRef {
   model: string
 }
 
+export function reasoningInitialValue(current: (ModelRef & { reasoningEffort?: string }) | undefined, next: ModelRef): string {
+  return current?.provider === next.provider && current.model === next.model
+    ? current.reasoningEffort ?? 'default'
+    : 'default'
+}
+
 export interface PickerItem {
   value: string
   label: string
   description?: string
+}
+
+export const OTHER_ANSWER_VALUE = 'answer:other'
+
+export function questionPickerItems(
+  options: readonly { label: string; description?: string }[],
+): PickerItem[] {
+  return options.map((option, index) => ({
+    value: `answer:${index}`,
+    label: option.label,
+    ...(option.description === undefined ? {} : { description: option.description }),
+  }))
+}
+
+export function questionLabelsFromValues(
+  values: readonly string[],
+  options: readonly { label: string }[],
+): string[] {
+  return values.flatMap(value => {
+    if (!value.startsWith('answer:') || value === OTHER_ANSWER_VALUE) return []
+    const option = options[Number(value.slice('answer:'.length))]
+    return option === undefined ? [] : [option.label]
+  })
 }
 
 export function filterPickerItems(items: readonly PickerItem[], prefix: string): PickerItem[] {
@@ -142,22 +171,4 @@ export function parseModelRef(value: string): ModelRef | undefined {
   const separator = normalized.indexOf('/')
   if (separator <= 0 || separator === normalized.length - 1) return undefined
   return { provider: normalized.slice(0, separator), model: normalized.slice(separator + 1) }
-}
-
-export interface MultiAnswer {
-  selected: string[]
-  custom?: string
-}
-
-export function parseMultiAnswer(value: string, labels: readonly string[]): MultiAnswer {
-  const parts = value.split(',').map(part => part.trim()).filter(Boolean)
-  const byLower = new Map(labels.map(label => [label.toLocaleLowerCase(), label]))
-  const selected: string[] = []
-  const custom: string[] = []
-  for (const part of parts) {
-    const known = byLower.get(part.toLocaleLowerCase())
-    if (known === undefined) custom.push(part)
-    else if (!selected.includes(known)) selected.push(known)
-  }
-  return { selected, ...(custom.length === 0 ? {} : { custom: custom.join(', ') }) }
 }

@@ -340,3 +340,80 @@ test('captures the complete model selection for status and settings', () => {
     { provider: 'deepseek-official', model: 'deepseek-v4', reasoningEffort: 'high' },
   )
 })
+
+test('keeps repeated plan, permission, and goal changes in chronological history', () => {
+  let state = createProjection('session-1')
+  state = foldSessionEvent(state, { seq: 1, time: 1, type: 'plan/mode', data: { active: true } })
+  state = foldSessionEvent(state, { seq: 2, time: 2, type: 'plan/mode', data: { active: false } })
+  state = foldSessionEvent(state, { seq: 3, time: 3, type: 'permission/preset', data: { preset: 'read-only' } })
+  state = foldSessionEvent(state, { seq: 4, time: 4, type: 'permission/preset', data: { preset: 'workspace-write' } })
+  state = foldSessionEvent(state, {
+    seq: 5,
+    time: 5,
+    type: 'goal/change',
+    data: { operation: 'create', goal: { objective: 'First', phase: 'active' } },
+  })
+  state = foldSessionEvent(state, { seq: 6, time: 6, type: 'goal/change', data: { operation: 'clear' } })
+
+  assert.deepEqual(state.entries.map(entry => entry.id), [
+    'system:plan:1',
+    'system:plan:2',
+    'system:permission:3',
+    'system:permission:4',
+    'system:goal:5',
+    'system:goal:6',
+  ])
+})
+
+test('keeps approval prompts out of history and appends only the decision result', () => {
+  let state = foldSessionEvent(createProjection('session-1'), {
+    seq: 1,
+    time: 1,
+    type: 'approval/asked',
+    data: { id: 'approval-1', toolName: 'bash', reason: 'Needs access' },
+  })
+  assert.deepEqual(state.entries, [])
+  state = foldSessionEvent(state, {
+    seq: 2,
+    time: 2,
+    type: 'approval/decided',
+    data: { id: 'approval-1', outcome: 'rejected' },
+  })
+  assert.equal(state.entries.length, 1)
+  assert.equal(state.entries[0]?.id, 'system:approval:approval-1:2')
+  assert.match(state.entries[0]?.text ?? '', /rejected/)
+})
+
+test('keeps ask-user prompts out of history and appends only the answer result', () => {
+  let state = foldSessionEvent(createProjection('session-1'), {
+    seq: 1,
+    time: 1,
+    type: 'tool/call',
+    data: {
+      callId: 'question-1',
+      name: 'ask_user_question',
+      arguments: JSON.stringify({ questions: [{ question: 'Secret prompt?' }] }),
+    },
+  })
+  assert.deepEqual(state.entries, [])
+  assert.deepEqual(state.activeTools, [{ id: 'question-1', name: 'ask_user_question' }])
+  state = foldSessionEvent(state, {
+    seq: 2,
+    time: 2,
+    type: 'tool/result',
+    data: {
+      message: {
+        source: { kind: 'tool', callId: 'question-1' },
+        content: [{
+          type: 'tool-result',
+          toolCallId: 'question-1',
+          isError: false,
+          content: [{ type: 'text', text: '{"answers":[{"selected":["A"]}]}' }],
+        }],
+      },
+    },
+  })
+  assert.equal(state.entries.length, 1)
+  assert.equal(state.entries[0]?.text, 'User answered question')
+  assert.match(state.entries[0]?.detail ?? '', /answers/)
+})

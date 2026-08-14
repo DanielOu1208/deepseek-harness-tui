@@ -7,17 +7,21 @@ import {
   ProcessTerminal,
   ScrollView,
   SelectList,
+  SettingsList,
+  Text,
   TuiAltScreen,
   VStack,
   matchesKey,
   truncateToWidth,
+  visibleWidth,
   type Component,
   type AutocompleteProvider,
   type EditorTheme,
   type MarkdownTheme,
-  type OverlayHandle,
   type SelectItem,
   type SelectListTheme,
+  type SettingItem,
+  type SettingsListTheme,
   type SlashCommand,
   type Terminal,
 } from '@earendil-works/pi-tui'
@@ -33,7 +37,7 @@ const yellow = ansi('33')
 const red = ansi('31')
 const green = ansi('32')
 const magenta = ansi('35')
-const FOOTER_CONTROLS = 'F2 settings · Ctrl+C stop / ×2 exit · Ctrl+D exit · /help'
+const BANNER_CONTROLS = '/ commands · @ files · F2 settings · Ctrl+C stop / ×2 exit · Ctrl+D exit · /help'
 
 /**
  * Remove terminal control strings supplied by models, tools, files, or plugins.
@@ -189,6 +193,11 @@ export function createCommandAutocomplete(
   }
 }
 
+const disabledAutocomplete: AutocompleteProvider = {
+  getSuggestions: async () => null,
+  applyCompletion: (lines, cursorLine, cursorCol) => ({ lines, cursorLine, cursorCol }),
+}
+
 // Half-block raster generated from DeepSeek's official MIT-licensed SVG:
 // https://github.com/deepseek-ai/DeepSeek-Coder-V2/blob/main/figures/logo.svg
 const OFFICIAL_DEEPSEEK_RASTER = [
@@ -205,7 +214,7 @@ const OFFICIAL_DEEPSEEK_RASTER = [
 ].join('\n')
 
 export function renderLaunchBanner(sessionId: string, cwd: string): string {
-  return `${deepseekBlue(OFFICIAL_DEEPSEEK_RASTER)}\n\n${bold(deepseekBlue('DeepSeek Harness TUI'))}\n${dim(`session  ${sanitizeTerminalText(sessionId)}`)}\n${dim(`cwd      ${sanitizeTerminalText(cwd)}`)}\n${dim(`/ for commands · @ for files · ${FOOTER_CONTROLS}`)}`
+  return `${deepseekBlue(OFFICIAL_DEEPSEEK_RASTER)}\n\n${bold(deepseekBlue('DeepSeek Harness TUI'))}\n${dim(`session  ${sanitizeTerminalText(sessionId)}`)}\n${dim(`cwd      ${sanitizeTerminalText(cwd)}`)}\n${dim(BANNER_CONTROLS)}`
 }
 
 function renderFileDiff(diff: FileDiff): string {
@@ -285,17 +294,14 @@ export function formatEntry(entry: TranscriptEntry): string {
   return text || '…'
 }
 
-export class ControlBar implements Component {
-  invalidate(): void {}
-
-  render(width: number): string[] {
-    return [truncateToWidth(dim('[F2 Settings]  [Ctrl+C Stop · ×2 Exit]  [Ctrl+D Exit]  [/ Commands]'), width, '')]
-  }
-}
-
 export class StatusLine implements Component {
   private state?: ProjectionState
-  private note = 'ready'
+  private note = ''
+  private isFollowingOutput: () => boolean = () => true
+
+  setFollowingOutputProvider(provider: () => boolean): void {
+    this.isFollowingOutput = provider
+  }
 
   update(state: ProjectionState, note?: string): void {
     this.state = state
@@ -311,25 +317,150 @@ export class StatusLine implements Component {
   render(width: number): string[] {
     if (this.state === undefined) return [truncateToWidth(dim(this.note), width, '')]
     const state = this.state
-    const activity = state.compacting ? yellow('compacting') : state.running ? yellow('running') : green('idle')
+    const followingOutput = this.isFollowingOutput()
+    const compactPrimary = width < 75 || (!followingOutput && width < 105)
+    const separator = dim(compactPrimary ? '│' : ' │ ')
+    const activity = state.lastError !== undefined
+      ? red(compactPrimary ? 'err' : 'error')
+      : state.compacting
+        ? yellow(compactPrimary ? 'cmp' : 'compacting')
+        : state.running ? yellow(compactPrimary ? 'run' : 'running') : green('idle')
+    const effort = truncateToWidth(sanitizeTerminalText(state.reasoningEffort ?? 'default'), compactPrimary ? 8 : 16, '…')
+    const reasoning = deepseekBlue(`${compactPrimary ? 'r:' : 'reason:'}${effort}`)
+    const mode = state.planMode ? deepseekBlue('plan') : dim('build')
+    const permissionName = sanitizeTerminalText(state.permissionPreset ?? 'permission?')
+    const permissionLabel = !compactPrimary ? permissionName : ({
+      'danger-full-access': 'F',
+      'workspace-write': 'W',
+      'read-only': 'R',
+      'permission?': '?',
+    }[permissionName] ?? 'C')
+    const permission = permissionName === 'danger-full-access'
+      ? red(permissionLabel)
+      : permissionName === 'workspace-write' || permissionName === 'custom' || permissionLabel === 'C'
+        ? yellow(permissionLabel)
+        : green(permissionLabel)
+    const scroll = followingOutput
+      ? undefined
+      : yellow(compactPrimary ? 'End↑' : 'history ↑ · End to latest')
+    const fixedPrimary = [activity, reasoning, mode, permission, ...(scroll === undefined ? [] : [scroll])]
+    const modelBudget = Math.max(
+      3,
+      width - fixedPrimary.reduce((total, segment) => total + visibleWidth(segment), 0)
+        - visibleWidth(separator) * fixedPrimary.length,
+    )
+    const rawModel = state.provider && state.model
+      ? width >= 100 && !compactPrimary
+        ? `${sanitizeTerminalText(state.provider)}/${sanitizeTerminalText(state.model)}`
+        : sanitizeTerminalText(state.model)
+      : 'model unavailable'
+    const modelText = truncateToWidth(rawModel, modelBudget, '…')
+    const model = state.provider && state.model ? deepseekBlue(modelText) : dim(modelText)
+    const primary = [model, reasoning, mode, permission, activity, ...(scroll === undefined ? [] : [scroll])]
+    let output = primary.join(separator)
+
     const tools = state.activeTools.length > 0
-      ? ` · ${state.activeTools.map(tool => sanitizeTerminalText(tool.name)).join(',')}`
-      : ''
-    const model = state.provider && state.model
-      ? ` · ${sanitizeTerminalText(state.provider)}/${sanitizeTerminalText(state.model)}${state.reasoningEffort ? ` · reasoning:${sanitizeTerminalText(state.reasoningEffort)}` : ''}`
-      : ''
-    const usage = state.usage ? ` · ${state.usage.inputTokens}→${state.usage.outputTokens} tok` : ''
+      ? yellow(`tool:${state.activeTools.map(tool => sanitizeTerminalText(tool.name)).join(',')}`)
+      : undefined
+    const usage = state.usage ? dim(`${state.usage.inputTokens}→${state.usage.outputTokens} tok`) : undefined
     const todo = state.todos.filter(item => item.status !== 'completed').length
-    const todos = todo > 0 ? ` · ${todo} todo` : ''
-    const mode = state.planMode ? ' · plan' : ''
-    const permission = state.permissionPreset ? ` · ${sanitizeTerminalText(state.permissionPreset)}` : ''
-    const goal = state.goal ? ` · goal:${sanitizeTerminalText(state.goal.phase)}` : ''
+    const todos = todo > 0 ? dim(`${todo} todo`) : undefined
+    const goal = state.goal ? dim(`goal:${sanitizeTerminalText(state.goal.phase)}`) : undefined
     const retry = state.retry
-      ? ` · retry:${state.retry.retry}${state.retry.maxRetries === undefined ? '' : `/${state.retry.maxRetries}`}`
-      : ''
+      ? yellow(`retry:${state.retry.retry}${state.retry.maxRetries === undefined ? '' : `/${state.retry.maxRetries}`}`)
+      : undefined
     const safeSession = sanitizeTerminalText(state.sessionId)
-    const session = safeSession.length > 20 ? `${safeSession.slice(0, 17)}…` : safeSession
-    return [truncateToWidth(`${activity}${tools} · ${session}${model}${mode}${permission}${goal}${retry}${usage}${todos} · ${dim(this.note)}`, width, '')]
+    const session = dim(safeSession.length > 18 ? `${safeSession.slice(0, 15)}…` : safeSession)
+    const note = this.note === '' || this.note === 'ready'
+      ? undefined
+      : this.note.startsWith('error:') ? red(this.note) : dim(this.note)
+    for (const segment of [tools, retry, session, usage, goal, todos, note]) {
+      if (segment === undefined) continue
+      const candidate = `${output}${separator}${segment}`
+      if (visibleWidth(candidate) <= width) output = candidate
+    }
+    return [truncateToWidth(output, width, '')]
+  }
+}
+
+const settingsTheme: SettingsListTheme = {
+  label: (text, selected) => selected ? bold(text) : text,
+  value: (text, selected) => selected ? deepseekBlue(text) : dim(text),
+  description: dim,
+  cursor: deepseekBlue('› '),
+  hint: dim,
+}
+
+export interface ChooseOptions {
+  initialValue?: string
+  priority?: 'optional' | 'required'
+}
+
+export interface SettingsChoice {
+  id: string
+  label: string
+  description?: string
+  currentValue: string
+}
+
+interface ActiveInteraction {
+  priority: 'optional' | 'required'
+  cancel(): void
+}
+
+class CheckboxList implements Component {
+  private list: SelectList
+  private selectedIndex = 0
+  private readonly selected = new Set<string>()
+  onSubmit?: (items: SelectItem[]) => void
+  onCancel?: () => void
+
+  constructor(private readonly items: SelectItem[], private readonly maxVisible: number) {
+    this.list = this.createList()
+  }
+
+  invalidate(): void {
+    this.list.invalidate()
+  }
+
+  render(width: number): string[] {
+    return this.list.render(width)
+  }
+
+  handleInput(data: string): void {
+    if (matchesKey(data, Key.escape)) {
+      this.onCancel?.()
+      return
+    }
+    if (data === ' ') {
+      const item = this.list.getSelectedItem()
+      if (item === null) return
+      if (this.selected.has(item.value)) this.selected.delete(item.value)
+      else this.selected.add(item.value)
+      this.rebuild()
+      return
+    }
+    if (matchesKey(data, Key.enter)) {
+      this.onSubmit?.(this.items.filter(item => this.selected.has(item.value)))
+      return
+    }
+    this.list.handleInput(data)
+    const current = this.list.getSelectedItem()
+    if (current !== null) this.selectedIndex = this.items.findIndex(item => item.value === current.value)
+  }
+
+  private rebuild(): void {
+    this.list = this.createList()
+    this.list.setSelectedIndex(this.selectedIndex)
+  }
+
+  private createList(): SelectList {
+    const list = new SelectList(this.items.map(item => ({
+      ...item,
+      label: `${this.selected.has(item.value) ? '[x]' : '[ ]'} ${item.label}`,
+    })), this.maxVisible, selectTheme)
+    list.setSelectedIndex(this.selectedIndex)
+    return list
   }
 }
 
@@ -350,15 +481,17 @@ export class DeepSeekTui {
   readonly tui: TuiAltScreen
   readonly editor: Editor
   private readonly transcript = new Container()
+  private readonly interactionHost = new Container()
   private readonly scroll: ScrollView
   private readonly status = new StatusLine()
   private readonly components = new Map<string, Markdown>()
-  private entryIds: string[] = []
-  private notices: string[] = []
+  private projectionIds = new Set<string>()
+  private sessionId?: string
   private projection?: ProjectionState
   private callbacks?: TuiCallbacks
   private pendingText?: PendingText
-  private overlayActive = false
+  private activeInteraction?: ActiveInteraction
+  private autocomplete?: AutocompleteProvider
   private readonly ctrlCExit = new CtrlCExitGate()
   private started = false
 
@@ -371,23 +504,25 @@ export class DeepSeekTui {
       overscroll: 'chain',
       scrollbar: 'auto',
     })
+    this.status.setFollowingOutputProvider(() => this.scroll.isFollowingEnd)
     this.tui.setLayoutRoot(new VStack([
       { component: this.scroll, basis: 0, grow: 1, minSize: 1 },
       {
         component: new VStack([
+          { component: this.interactionHost, basis: 'auto', shrink: 1, minSize: 0, maxSize: 14 },
           { component: this.editor, basis: 'auto', shrink: 1, minSize: 1 },
           { component: this.status, basis: 1, shrink: 0 },
-          { component: new ControlBar(), basis: 1, shrink: 0 },
         ]),
         basis: 'auto',
         shrink: 1,
-        minSize: 3,
+        minSize: 2,
       },
     ]))
   }
 
   setSlashCommands(commands: readonly SlashCommand[], cwd: string): void {
-    this.editor.setAutocompleteProvider(createCommandAutocomplete(commands, cwd))
+    this.autocomplete = createCommandAutocomplete(commands, cwd)
+    if (this.pendingText === undefined) this.editor.setAutocompleteProvider(this.autocomplete)
   }
 
   start(callbacks: TuiCallbacks): void {
@@ -397,7 +532,6 @@ export class DeepSeekTui {
     this.editor.onSubmit = (text) => {
       if (text.trim() === '') return
       this.ctrlCExit.reset()
-      this.editor.addToHistory(text)
       if (this.pendingText !== undefined) {
         const pending = this.pendingText
         this.pendingText = undefined
@@ -406,12 +540,13 @@ export class DeepSeekTui {
         this.tui.requestRender()
         return
       }
+      this.editor.addToHistory(text)
       void Promise.resolve(callbacks.onPrompt(text)).catch(error => this.flashError(error))
     }
     this.tui.addInputListener((data) => {
       if (isSettingsShortcut(data)) {
         this.ctrlCExit.reset()
-        if (this.pendingText === undefined && !this.overlayActive) {
+        if (this.activeInteraction === undefined) {
           void Promise.resolve(callbacks.onSettings()).catch(error => this.flashError(error))
         } else {
           this.tui.flash('Finish the current dialog before opening Settings.', 2500)
@@ -423,17 +558,20 @@ export class DeepSeekTui {
           void Promise.resolve(callbacks.onExit()).catch(error => this.flashError(error))
           return { consume: true }
         }
-        if (this.pendingText !== undefined) {
-          const pending = this.pendingText
-          this.pendingText = undefined
-          pending.reject(new Error('cancelled by user'))
-        } else {
-          void Promise.resolve(callbacks.onInterrupt()).catch(error => this.flashError(error))
-        }
+        this.activeInteraction?.cancel()
+        void Promise.resolve(callbacks.onInterrupt()).catch(error => this.flashError(error))
         this.setStatus('Ctrl+C again to exit')
         return { consume: true }
       }
+      if (matchesKey(data, Key.escape) && this.pendingText !== undefined) {
+        this.activeInteraction?.cancel()
+        return { consume: true }
+      }
       this.ctrlCExit.reset()
+      if (matchesKey(data, Key.ctrl('d')) && this.activeInteraction !== undefined) {
+        this.tui.flash('Close the current dialog before exiting.', 2000)
+        return { consume: true }
+      }
       if (matchesKey(data, Key.ctrl('d')) && this.editor.getText() === '') {
         void Promise.resolve(callbacks.onExit()).catch(error => this.flashError(error))
         return { consume: true }
@@ -447,44 +585,45 @@ export class DeepSeekTui {
   stop(): void {
     if (!this.started) return
     this.started = false
-    this.pendingText?.reject(new Error('terminal closed'))
-    this.pendingText = undefined
-    this.overlayActive = false
+    this.activeInteraction?.cancel()
     this.tui.stop()
   }
 
   renderProjection(state: ProjectionState): void {
+    if (this.sessionId !== undefined && state.sessionId !== this.sessionId) this.resetTimeline(state.sessionId)
+    this.sessionId ??= state.sessionId
     this.projection = state
-    const nextIds = state.entries.map(entry => entry.id)
-    const sameOrder = nextIds.length === this.entryIds.length
-      && nextIds.every((id, index) => id === this.entryIds[index])
-    if (!sameOrder) {
-      this.transcript.clear()
-      this.components.clear()
-      for (const entry of state.entries) {
-        const component = this.markdown(formatEntry(entry))
-        this.components.set(entry.id, component)
-        this.transcript.addChild(component)
-      }
-      for (const notice of this.notices) this.transcript.addChild(this.markdown(notice))
-      this.entryIds = nextIds
-    } else {
-      for (const entry of state.entries) this.components.get(entry.id)?.setText(formatEntry(entry))
+    const nextIds = new Set(state.entries.map(entry => entry.id))
+    for (const id of this.projectionIds) {
+      if (nextIds.has(id)) continue
+      const component = this.components.get(id)
+      if (component !== undefined) this.transcript.removeChild(component)
+      this.components.delete(id)
     }
-    this.status.update(state, state.lastError ?? 'ready')
+    for (const entry of state.entries) {
+      const existing = this.components.get(entry.id)
+      if (existing !== undefined) {
+        existing.setText(formatEntry(entry))
+        continue
+      }
+      const component = this.markdown(formatEntry(entry))
+      this.components.set(entry.id, component)
+      this.transcript.addChild(component)
+    }
+    this.projectionIds = nextIds
+    this.status.update(state, state.lastError === undefined ? '' : `error: ${state.lastError}`)
     this.tui.requestRender()
   }
 
   appendNotice(text: string): void {
     const source = `${yellow('System')}\n${sanitizeTerminalText(text)}`
-    this.notices.push(source)
     this.transcript.addChild(this.markdown(source))
     this.tui.requestRender()
   }
 
   appendLaunchBanner(sessionId: string, cwd: string): void {
+    this.resetTimeline(sessionId)
     const source = renderLaunchBanner(sessionId, cwd)
-    this.notices.push(source)
     this.transcript.addChild(this.markdown(source))
     this.tui.requestRender()
   }
@@ -498,77 +637,202 @@ export class DeepSeekTui {
   flashError(error: unknown): void {
     const text = sanitizeTerminalText(error instanceof Error ? error.message : String(error))
     this.tui.flash(`Error: ${text}`, 5000)
+    this.appendNotice(`Error: ${text}`)
     this.setStatus(`error: ${text}`)
   }
 
-  async choose(title: string, items: SelectItem[], signal?: AbortSignal): Promise<SelectItem | undefined> {
+  async choose(
+    title: string,
+    items: SelectItem[],
+    signal?: AbortSignal,
+    options: ChooseOptions = {},
+  ): Promise<SelectItem | undefined> {
     if (signal?.aborted) return undefined
-    if (this.overlayActive) throw new Error('another terminal menu is already active')
-    this.appendNotice(title)
     return await new Promise<SelectItem | undefined>((resolve) => {
       const safeItems = items.map(item => ({
         ...item,
-        label: sanitizeTerminalText(item.label),
+        label: `${item.value === options.initialValue ? '✓ ' : '  '}${sanitizeTerminalText(item.label)}`,
         ...(item.description === undefined
           ? {}
           : { description: sanitizeTerminalText(item.description) }),
       }))
-      const list = new SelectList(safeItems, Math.min(10, Math.max(3, safeItems.length)), selectTheme)
+      const list = new SelectList(safeItems, Math.min(8, Math.max(3, safeItems.length)), selectTheme)
+      const selectedIndex = items.findIndex(item => item.value === options.initialValue)
+      if (selectedIndex >= 0) list.setSelectedIndex(selectedIndex)
       let settled = false
-      let handle: OverlayHandle
       const settle = (item: SelectItem | undefined): void => {
         if (settled) return
         settled = true
         signal?.removeEventListener('abort', abort)
-        handle.hide()
-        this.overlayActive = false
-        this.tui.setFocus(this.editor)
-        resolve(item)
+        this.closeInteraction(interaction)
+        if (item === undefined) resolve(undefined)
+        else resolve(items.find(original => original.value === item.value))
       }
       const abort = (): void => settle(undefined)
       list.onSelect = settle
       list.onCancel = () => settle(undefined)
-      this.overlayActive = true
-      try {
-        handle = this.tui.showOverlay(list, {
-          width: '70%',
-          maxHeight: '70%',
-          anchor: 'center',
-          margin: 1,
-        })
-      } catch (error) {
-        this.overlayActive = false
-        throw error
+      const interaction: ActiveInteraction = {
+        priority: options.priority ?? 'optional',
+        cancel: () => settle(undefined),
       }
+      this.openInteraction(title, list, '↑↓ move · Enter select · Esc close', interaction)
       signal?.addEventListener('abort', abort, { once: true })
     })
   }
 
-  async promptText(title: string, signal?: AbortSignal): Promise<string | undefined> {
+  async chooseMany(
+    title: string,
+    items: SelectItem[],
+    signal?: AbortSignal,
+    options: ChooseOptions = {},
+  ): Promise<SelectItem[] | undefined> {
     if (signal?.aborted) return undefined
-    if (this.pendingText !== undefined) throw new Error('another terminal question is already active')
-    this.appendNotice(title)
-    this.setStatus('answer the question above · Ctrl+C cancel')
+    return await new Promise<SelectItem[] | undefined>((resolve) => {
+      const safeItems = items.map(item => ({
+        ...item,
+        label: sanitizeTerminalText(item.label),
+        ...(item.description === undefined ? {} : { description: sanitizeTerminalText(item.description) }),
+      }))
+      const list = new CheckboxList(safeItems, Math.min(8, Math.max(3, safeItems.length)))
+      let settled = false
+      const settle = (selected: SelectItem[] | undefined): void => {
+        if (settled) return
+        settled = true
+        signal?.removeEventListener('abort', abort)
+        this.closeInteraction(interaction)
+        resolve(selected)
+      }
+      const abort = (): void => settle(undefined)
+      list.onSubmit = selected => settle(selected.map(item => items.find(original => original.value === item.value)!))
+      list.onCancel = () => settle(undefined)
+      const interaction: ActiveInteraction = {
+        priority: options.priority ?? 'optional',
+        cancel: () => settle(undefined),
+      }
+      this.openInteraction(title, list, '↑↓ move · Space toggle · Enter submit · Esc close', interaction)
+      signal?.addEventListener('abort', abort, { once: true })
+    })
+  }
+
+  async chooseSetting(
+    title: string,
+    items: SettingsChoice[],
+    signal?: AbortSignal,
+    initialId?: string,
+  ): Promise<string | undefined> {
+    if (signal?.aborted) return undefined
     return await new Promise<string | undefined>((resolve) => {
-      const abort = (): void => {
+      let settled = false
+      const settingsItems: SettingItem[] = items.map(item => ({
+        id: item.id,
+        label: sanitizeTerminalText(item.label),
+        description: item.description === undefined ? undefined : sanitizeTerminalText(item.description),
+        currentValue: sanitizeTerminalText(item.currentValue),
+        values: [sanitizeTerminalText(item.currentValue)],
+      }))
+      const settle = (id: string | undefined): void => {
+        if (settled) return
+        settled = true
+        signal?.removeEventListener('abort', abort)
+        this.closeInteraction(interaction)
+        resolve(id)
+      }
+      const list = new SettingsList(
+        settingsItems,
+        Math.min(8, Math.max(3, items.length)),
+        settingsTheme,
+        id => settle(id),
+        () => settle(undefined),
+        { enableSearch: false },
+      )
+      const initialIndex = items.findIndex(item => item.id === initialId)
+      for (let index = 0; index < initialIndex; index += 1) list.handleInput('\u001b[B')
+      const abort = (): void => settle(undefined)
+      const interaction: ActiveInteraction = { priority: 'optional', cancel: () => settle(undefined) }
+      this.openInteraction(title, list, 'Enter open · Esc close', interaction)
+      signal?.addEventListener('abort', abort, { once: true })
+    })
+  }
+
+  async promptText(title: string, signal?: AbortSignal, options: ChooseOptions = {}): Promise<string | undefined> {
+    if (signal?.aborted) return undefined
+    const priority = options.priority ?? 'optional'
+    this.prepareInteraction(priority)
+    const draft = this.editor.getText()
+    this.editor.setText('')
+    this.editor.setAutocompleteProvider(disabledAutocomplete)
+    return await new Promise<string | undefined>((resolve) => {
+      let settled = false
+      const settle = (value: string | undefined): void => {
+        if (settled) return
+        settled = true
+        signal?.removeEventListener('abort', abort)
         if (this.pendingText === pending) this.pendingText = undefined
-        resolve(undefined)
+        this.closeInteraction(interaction)
+        this.editor.setText(draft)
+        if (this.autocomplete !== undefined) this.editor.setAutocompleteProvider(this.autocomplete)
+        resolve(value)
+      }
+      const abort = (): void => {
+        settle(undefined)
       }
       const pending: PendingText = {
         signal,
-        resolve: (value) => {
-          signal?.removeEventListener('abort', abort)
-          resolve(value)
-        },
-        reject: () => {
-          signal?.removeEventListener('abort', abort)
-          resolve(undefined)
-        },
+        resolve: value => settle(value),
+        reject: () => settle(undefined),
+      }
+      const interaction: ActiveInteraction = {
+        priority,
+        cancel: () => settle(undefined),
       }
       this.pendingText = pending
+      this.openInteraction(title, this.editor, 'Type your answer · Enter submit · Esc close', interaction, false)
       signal?.addEventListener('abort', abort, { once: true })
       this.tui.setFocus(this.editor)
     })
+  }
+
+  private openInteraction(
+    title: string,
+    component: Component,
+    hint: string,
+    interaction: ActiveInteraction,
+    mountComponent = true,
+  ): void {
+    this.prepareInteraction(interaction.priority)
+    this.interactionHost.clear()
+    this.interactionHost.addChild(new Markdown(sanitizeTerminalText(title), 1, 0, markdownTheme))
+    if (mountComponent) this.interactionHost.addChild(component)
+    this.interactionHost.addChild(new Text(dim(hint), 1, 0))
+    this.activeInteraction = interaction
+    this.tui.setFocus(component)
+    this.tui.requestRender()
+  }
+
+  private prepareInteraction(priority: ActiveInteraction['priority']): void {
+    if (this.activeInteraction === undefined) return
+    if (priority === 'required' && this.activeInteraction.priority === 'optional') {
+      this.activeInteraction.cancel()
+      return
+    }
+    throw new Error('another terminal interaction is already active')
+  }
+
+  private closeInteraction(interaction: ActiveInteraction): void {
+    if (this.activeInteraction !== interaction) return
+    this.activeInteraction = undefined
+    this.interactionHost.clear()
+    this.tui.setFocus(this.editor)
+    this.tui.requestRender()
+  }
+
+  private resetTimeline(sessionId: string): void {
+    this.sessionId = sessionId
+    this.transcript.clear()
+    this.components.clear()
+    this.projectionIds.clear()
+    this.projection = undefined
+    this.scroll.scrollToEnd()
   }
 
   private markdown(text: string): Markdown {

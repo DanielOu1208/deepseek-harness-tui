@@ -39,7 +39,8 @@ test('builds one discoverable slash-command catalog from local and Harness comma
   assert.equal(commands.filter(command => command.name === 'permission').length, 1)
   assert.match(commands.find(command => command.name === 'permission')?.description ?? '', /permission mode/i)
   assert.ok(commands.some(command => command.name === 'resume'))
-  assert.match(commands.find(command => command.name === 'setting')?.description ?? '', /settings menu/i)
+  assert.equal(commands.some(command => command.name === 'setting'), false)
+  assert.match(commands.find(command => command.name === 'settings')?.description ?? '', /settings menu/i)
   assert.deepEqual(commands.map(command => command.name), [...commands.map(command => command.name)].sort())
 })
 

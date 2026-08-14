@@ -20,7 +20,7 @@ declare module '@deepseek-ai/cordis' {
 
 export function createTuiCommand(onParsed: (options: TuiStartupOptions) => void): Command {
   const program = new Command()
-    .name('dsh --profile tui')
+    .name('deepseek')
     .description('Run the official DeepSeek Harness through an interactive terminal UI.')
     .helpOption('-h, --help', 'show this help')
     .option('-r, --resume <session-id>', 'resume a persisted session')
@@ -29,9 +29,9 @@ export function createTuiCommand(onParsed: (options: TuiStartupOptions) => void)
     .argument('[initial-prompt...]', 'optional initial prompt without --prompt')
     .addHelpText('after', `
 Examples:
-  dsh --profile tui
-  dsh --profile tui --resume session-abc
-  dsh --profile tui "fix the failing tests"
+  deepseek
+  deepseek --resume session-abc
+  deepseek "fix the failing tests"
 `)
 
   program.action(() => {

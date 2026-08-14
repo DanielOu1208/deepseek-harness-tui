@@ -4,14 +4,17 @@ import {
   BUSY_PICKER_ITEMS,
   GOAL_PICKER_ITEMS,
   NESTED_MENU_COMMANDS,
+  OTHER_ANSWER_VALUE,
   PERMISSION_PICKER_ITEMS,
   PLAN_PICKER_ITEMS,
   SETTINGS_PICKER_ITEMS,
   filterPickerItems,
   modelPickerItems,
   parseModelRef,
-  parseMultiAnswer,
   parseSettingsPatch,
+  questionLabelsFromValues,
+  questionPickerItems,
+  reasoningInitialValue,
   reasoningPickerItems,
   sessionPickerItems,
   settingsNamespacePickerItems,
@@ -23,11 +26,21 @@ test('parses provider/model while preserving slashes in model ids', () => {
   assert.equal(parseModelRef('/missing-provider'), undefined)
 })
 
-test('splits multi-select labels from custom text', () => {
-  assert.deepEqual(parseMultiAnswer('Read files, Run tests, add docs', ['Read files', 'Run tests']), {
-    selected: ['Read files', 'Run tests'],
-    custom: 'add docs',
-  })
+test('preserves the current reasoning effort only when reselecting the same model', () => {
+  const current = { provider: 'deepseek', model: 'v4', reasoningEffort: 'high' }
+  assert.equal(reasoningInitialValue(current, { provider: 'deepseek', model: 'v4' }), 'high')
+  assert.equal(reasoningInitialValue(current, { provider: 'deepseek', model: 'v5' }), 'default')
+})
+
+test('uses internal question IDs so duplicate and sentinel-like labels stay independent', () => {
+  const options = [{ label: '__other__' }, { label: 'Same' }, { label: 'Same' }]
+  const items = questionPickerItems(options)
+  assert.deepEqual(items.map(item => item.value), ['answer:0', 'answer:1', 'answer:2'])
+  assert.equal(items.some(item => item.value === OTHER_ANSWER_VALUE), false)
+  assert.deepEqual(questionLabelsFromValues(['answer:0', 'answer:2', OTHER_ANSWER_VALUE], options), [
+    '__other__',
+    'Same',
+  ])
 })
 
 test('builds nested model picker items with provider-qualified values', () => {

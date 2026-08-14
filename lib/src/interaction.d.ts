@@ -2,11 +2,22 @@ export interface ModelRef {
     provider: string;
     model: string;
 }
+export declare function reasoningInitialValue(current: (ModelRef & {
+    reasoningEffort?: string;
+}) | undefined, next: ModelRef): string;
 export interface PickerItem {
     value: string;
     label: string;
     description?: string;
 }
+export declare const OTHER_ANSWER_VALUE = "answer:other";
+export declare function questionPickerItems(options: readonly {
+    label: string;
+    description?: string;
+}[]): PickerItem[];
+export declare function questionLabelsFromValues(values: readonly string[], options: readonly {
+    label: string;
+}[]): string[];
 export declare function filterPickerItems(items: readonly PickerItem[], prefix: string): PickerItem[];
 export interface ModelPickerSource extends ModelRef {
     name: string;
@@ -42,8 +53,3 @@ export declare function settingsNamespacePickerItems(descriptors: readonly Setti
 export declare function parseSettingsPatch(text: string): Record<string, unknown>;
 export declare const NESTED_MENU_COMMANDS: Set<string>;
 export declare function parseModelRef(value: string): ModelRef | undefined;
-export interface MultiAnswer {
-    selected: string[];
-    custom?: string;
-}
-export declare function parseMultiAnswer(value: string, labels: readonly string[]): MultiAnswer;

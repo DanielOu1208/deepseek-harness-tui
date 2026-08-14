@@ -28,13 +28,16 @@ import { buildSlashCommands, formatCommandHelp, parseInput } from './commands.js
 import {
   BUSY_PICKER_ITEMS,
   GOAL_PICKER_ITEMS,
+  OTHER_ANSWER_VALUE,
   PLAN_PICKER_ITEMS,
   SETTINGS_PICKER_ITEMS,
   filterPickerItems,
   modelPickerItems,
   parseModelRef,
-  parseMultiAnswer,
   parseSettingsPatch,
+  questionLabelsFromValues,
+  questionPickerItems,
+  reasoningInitialValue,
   reasoningPickerItems,
   sessionPickerItems,
   settingsNamespacePickerItems,
@@ -114,6 +117,10 @@ export class DshTuiRunner {
     if (this.closing) return
     this.installInteractions()
     await this.open(this.startup.resume)
+    this.ui.appendLaunchBanner(
+      String(this.agent.id),
+      this.agent.session.header.cwd ?? resolve(this.startup.cwd ?? process.cwd()),
+    )
     this.ui.start({
       onPrompt: text => this.submit(text),
       onSettings: () => this.chooseSettings(),
@@ -122,10 +129,6 @@ export class DshTuiRunner {
     })
     this.started = true
     this.refresh()
-    this.ui.appendLaunchBanner(
-      String(this.agent.id),
-      this.agent.session.header.cwd ?? resolve(this.startup.cwd ?? process.cwd()),
-    )
     if (this.startup.prompt !== undefined) await this.submit(this.startup.prompt)
   }
 
@@ -150,6 +153,7 @@ export class DshTuiRunner {
         { value: 'reject', label: 'Reject', description: 'Deny this action' },
       ],
       request.signal,
+      { initialValue: 'reject', priority: 'required' },
     )
     if (request.signal?.aborted) return 'cancelled'
     return choice?.value === 'allow' ? 'allowed-once' : choice?.value === 'reject' ? 'rejected' : 'cancelled'
@@ -164,28 +168,44 @@ export class DshTuiRunner {
       if (request.signal?.aborted) throw new Error('question cancelled')
       const title = questionTitle(question)
       const options = question.options ?? []
+      const optionItems = questionPickerItems(options)
       if (question.multiSelect) {
-        const text = await this.ui.promptText(
-          `${title}\n\nEnter comma-separated choices${options.length ? `:\n${options.map(item => `- ${item.label}`).join('\n')}` : ''}`,
-          request.signal,
-        )
-        if (text === undefined) throw new Error('question cancelled')
-        const parsed = parseMultiAnswer(text, options.map(option => option.label))
-        answers.push({ id: question.id, ...parsed })
+        if (options.length === 0) {
+          const custom = await this.ui.promptText(`${title}\n\nType your answer:`, request.signal, { priority: 'required' })
+          if (custom === undefined) throw new Error('question cancelled')
+          answers.push({ id: question.id, selected: [], custom })
+          continue
+        }
+        const selected = await this.ui.chooseMany(title, [
+          ...optionItems,
+          { value: OTHER_ANSWER_VALUE, label: 'Other…', description: 'Add a custom answer' },
+        ], request.signal, { priority: 'required' })
+        if (selected === undefined) throw new Error('question cancelled')
+        const customRequested = selected.some(item => item.value === OTHER_ANSWER_VALUE)
+        const labels = questionLabelsFromValues(selected.map(item => item.value), options)
+        if (!customRequested) {
+          answers.push({ id: question.id, selected: labels })
+          continue
+        }
+        const custom = await this.ui.promptText(`${title}\n\nType the additional answer:`, request.signal, { priority: 'required' })
+        if (custom === undefined) throw new Error('question cancelled')
+        answers.push({ id: question.id, selected: labels, custom })
         continue
       }
       if (options.length > 0) {
         const choice = await this.ui.choose(title, [
-          ...options.map(option => ({ value: option.label, label: option.label, description: option.description })),
-          { value: '__other__', label: 'Other…', description: 'Type a custom answer' },
-        ], request.signal)
+          ...optionItems,
+          { value: OTHER_ANSWER_VALUE, label: 'Other…', description: 'Type a custom answer' },
+        ], request.signal, { priority: 'required' })
         if (choice === undefined) throw new Error('question cancelled')
-        if (choice.value !== '__other__') {
-          answers.push({ id: question.id, selected: [choice.value] })
+        if (choice.value !== OTHER_ANSWER_VALUE) {
+          const labels = questionLabelsFromValues([choice.value], options)
+          if (labels[0] === undefined) throw new Error('question choice is no longer available')
+          answers.push({ id: question.id, selected: [labels[0]] })
           continue
         }
       }
-      const custom = await this.ui.promptText(`${title}\n\nType your answer:`, request.signal)
+      const custom = await this.ui.promptText(`${title}\n\nType your answer:`, request.signal, { priority: 'required' })
       if (custom === undefined) throw new Error('question cancelled')
       answers.push({ id: question.id, selected: [], custom })
     }
@@ -234,7 +254,6 @@ export class DshTuiRunner {
       }),
     )
     this.refreshSlashCommands(agent)
-    this.refresh()
   }
 
   private refreshSlashCommands(agent: Agent): void {
@@ -261,7 +280,6 @@ export class DshTuiRunner {
         case 'busy':
           command.getArgumentCompletions = prefix => filterPickerItems(BUSY_PICKER_ITEMS, prefix)
           break
-        case 'setting':
         case 'settings':
           command.getArgumentCompletions = prefix => filterPickerItems([
             ...SETTINGS_PICKER_ITEMS,
@@ -425,6 +443,10 @@ export class DshTuiRunner {
     this.ui.setStatus(resumeId ? `opening ${resumeId}…` : 'creating a new session…')
     await this.detachCurrent()
     await this.open(resumeId)
+    this.ui.appendLaunchBanner(
+      String(this.agent.id),
+      this.agent.session.header.cwd ?? resolve(this.startup.cwd ?? process.cwd()),
+    )
     this.ui.appendNotice(resumeId ? `Resumed ${resumeId}` : `New session ${this.agent.id}`)
     this.refresh()
   }
@@ -483,7 +505,9 @@ export class DshTuiRunner {
   }
 
   private async choosePermission(): Promise<void> {
-    const choice = await this.ui.choose('Choose a permission mode', this.permissionPickerItems())
+    const choice = await this.ui.choose('Choose a permission mode', this.permissionPickerItems(), undefined, {
+      initialValue: this.ctx.permissionPresets.current(this.agent.session.events),
+    })
     if (choice !== undefined) await this.runHarnessCommand(`/permission ${choice.value}`)
   }
 
@@ -507,7 +531,9 @@ export class DshTuiRunner {
   }
 
   private async choosePlanCommand(): Promise<void> {
-    const choice = await this.ui.choose('Plan mode', [...PLAN_PICKER_ITEMS])
+    const choice = await this.ui.choose('Plan mode', [...PLAN_PICKER_ITEMS], undefined, {
+      initialValue: this.projection?.planMode ? 'enter' : 'off',
+    })
     if (choice === undefined) return
     if (choice.value === 'message') {
       const guidance = await this.ui.promptText('Enter plan-mode guidance:')
@@ -554,7 +580,10 @@ export class DshTuiRunner {
         this.ui.appendNotice('No models are currently available.')
         return
       }
-      const choice = await this.ui.choose('Choose a model', items)
+      const current = this.selection?.current
+      const choice = await this.ui.choose('Choose a model', items, undefined, {
+        initialValue: current === undefined ? undefined : `${current.provider}/${current.model}`,
+      })
       if (choice === undefined) return
       value = choice.value
     }
@@ -562,10 +591,25 @@ export class DshTuiRunner {
     if (ref === undefined) throw new Error('usage: /model <provider>/<model>')
     const info = await this.ctx.llm.resolveModelInfo(ref.provider, ref.model)
     if (this.selection === undefined) throw new Error('model selection is unavailable')
-    this.selection.current = ref
-    this.ui.appendNotice(`Next request will use ${ref.provider}/${ref.model}`)
+    let next: ModelSelection = ref
+    if (interactive && info.reasoning !== undefined) {
+      const reasoning = await this.ui.choose(
+        'Choose reasoning effort',
+        reasoningPickerItems(info.reasoning),
+        undefined,
+        { initialValue: reasoningInitialValue(this.selection.current, ref) },
+      )
+      if (reasoning === undefined) return
+      next = {
+        ...ref,
+        ...(reasoning.value === 'default' ? {} : { reasoningEffort: ReasoningEffortId(reasoning.value) }),
+      }
+    }
+    this.selection.current = next
+    this.ui.appendNotice(
+      `Next request will use ${ref.provider}/${ref.model} · reasoning ${next.reasoningEffort ?? 'model default'}`,
+    )
     this.refresh()
-    if (interactive && info.reasoning !== undefined) await this.chooseReasoning()
   }
 
   private async loadReasoningPickerItems(): Promise<PickerItem[]> {
@@ -581,7 +625,9 @@ export class DshTuiRunner {
       this.ui.appendNotice('The current model does not expose configurable reasoning effort.')
       return
     }
-    const choice = await this.ui.choose('Choose reasoning effort', items)
+    const choice = await this.ui.choose('Choose reasoning effort', items, undefined, {
+      initialValue: this.selection?.current?.reasoningEffort ?? 'default',
+    })
     if (choice !== undefined) await this.selectReasoning(choice.value)
   }
 
@@ -611,7 +657,9 @@ export class DshTuiRunner {
 
   private async selectBusyEnter(value: string): Promise<void> {
     if (value.trim() === '') {
-      const choice = await this.ui.choose('Plain Enter while the agent is busy', [...BUSY_PICKER_ITEMS])
+      const choice = await this.ui.choose('Plain Enter while the agent is busy', [...BUSY_PICKER_ITEMS], undefined, {
+        initialValue: this.busyEnter,
+      })
       if (choice === undefined) return
       value = choice.value
     }
@@ -699,12 +747,43 @@ export class DshTuiRunner {
     this.ui.appendNotice(`Updated ${descriptor.ns}. ${descriptor.applies === 'restart' ? 'Restart the TUI to apply it.' : 'Applied live.'}`)
   }
 
-  private async chooseSettings(action = ''): Promise<void> {
-    if (action.trim() === '') {
-      const choice = await this.ui.choose('Core settings', [...SETTINGS_PICKER_ITEMS])
-      if (choice === undefined) return
-      action = choice.value
+  private settingsChoices() {
+    const current = this.selection?.current
+    const defaults = this.ctx.agentDefaultModel.currentSelection()
+    const permission = this.ctx.permissionPresets.current(this.agent.session.events)
+    const values: Record<string, string> = {
+      summary: 'view',
+      model: current === undefined ? 'unavailable' : `${current.provider}/${current.model}`,
+      reasoning: current?.reasoningEffort ?? 'model default',
+      permission,
+      busy: this.busyEnter,
+      'save-model-default': `${defaults.provider}/${defaults.model}`,
+      'save-permission-default': this.ctx.permissionPresets.defaultPreset,
+      advanced: `${this.ctx.settings.describe({ redactSecrets: true }).length} namespaces`,
     }
+    return SETTINGS_PICKER_ITEMS.map(item => ({
+      id: item.value,
+      label: item.label,
+      description: item.description,
+      currentValue: values[item.value] ?? '',
+    }))
+  }
+
+  private async chooseSettings(action = ''): Promise<void> {
+    if (action.trim() !== '') {
+      await this.applySetting(action.trim())
+      return
+    }
+    let selectedId: string | undefined
+    while (!this.closing) {
+      const choice = await this.ui.chooseSetting('Core settings', this.settingsChoices(), undefined, selectedId)
+      if (choice === undefined) return
+      selectedId = choice
+      await this.applySetting(choice)
+    }
+  }
+
+  private async applySetting(action: string): Promise<void> {
     switch (action.trim()) {
       case 'summary': this.ui.appendNotice(this.settingsSummary()); return
       case 'model': await this.selectModel(''); return
@@ -744,7 +823,7 @@ export class DshTuiRunner {
     await this.agent.whenIdle()
     await this.ctx.sessions.flush(this.agent.session)
     this.ui.stop()
-    process.stdout.write(`Paused DeepSeek session ${id}\nResume with: dsh --profile tui --resume ${id}\n`)
+    process.stdout.write(`Paused DeepSeek session ${id}\nResume with: deepseek --resume ${id}\n`)
     await this.shutdown(true, false)
   }
 

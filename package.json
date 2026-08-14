@@ -16,6 +16,9 @@
   "type": "module",
   "main": "./lib/src/index.js",
   "types": "./lib/src/index.d.ts",
+  "bin": {
+    "deepseek": "./lib/src/bin.js"
+  },
   "exports": {
     ".": {
       "types": "./lib/src/index.d.ts",
@@ -39,7 +42,13 @@
     "pack:check": "npm run clean && npm run build && npm pack --dry-run --ignore-scripts"
   },
   "dependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/dsh": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-app-boot": "0.1.0-rc.6",
     "@deepseek-ai/dsh-cmdline": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-credentials": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-credentials-local": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-launch-environment": "0.1.0-rc.6",
     "@deepseek-ai/dsh-tool-ask-user": "0.1.0-rc.6",
     "@earendil-works/pi-tui": "0.84.1",
     "commander": "^15.0.0"
@@ -61,7 +70,6 @@
     "@deepseek-ai/dsh-user-questions": "0.1.0-rc.6"
   },
   "devDependencies": {
-    "@deepseek-ai/dsh": "0.1.0-rc.6",
     "@deepseek-ai/dsh-base": "0.1.0-rc.6",
     "@types/node": "^24.0.0",
     "tsx": "^4.20.0",

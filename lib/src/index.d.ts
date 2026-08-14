@@ -48,7 +48,9 @@ export declare class DshTuiRunner {
     private settingsSummary;
     private loadSettingsNamespacePickerItems;
     private editAdvancedSettings;
+    private settingsChoices;
     private chooseSettings;
+    private applySetting;
     private pauseAndExit;
     shutdown(requestExit: boolean, stopUi?: boolean): Promise<void>;
 }
