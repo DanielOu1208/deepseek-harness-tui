@@ -209,6 +209,14 @@ function markdownFence(value: string): string {
   return '`'.repeat(Math.max(3, longest + 1))
 }
 
+function markdownCode(value: unknown, fallback: string): string {
+  const text = markdownInline(value) || fallback
+  const longest = Math.max(0, ...text.match(/`+/gu)?.map(match => match.length) ?? [])
+  const fence = '`'.repeat(longest + 1)
+  const padding = text.startsWith('`') || text.endsWith('`') ? ' ' : ''
+  return `${fence}${padding}${text}${padding}${fence}`
+}
+
 function projectionEntries(value: unknown): readonly Record<string, unknown>[] | undefined {
   if (typeof value !== 'object' || value === null) return undefined
   const entries = (value as { entries?: unknown }).entries
@@ -265,9 +273,9 @@ export function renderSessionExportMarkdown(input: SessionExportInput, signal?: 
     '',
     `> ${SESSION_EXPORT_DISCLOSURE}`,
     '',
-    `- Session: \`${markdownInline(sessionId) || 'unknown'}\``,
+    `- Session: ${markdownCode(sessionId, 'unknown')}`,
     `- Events: ${String(envelope.session.events.length)}`,
-    ...(typeof cwd === 'string' && cwd !== '' ? [`- Working directory: \`${cwd.replace(/`/gu, '\\`')}\``] : []),
+    ...(typeof cwd === 'string' && cwd !== '' ? [`- Working directory: ${markdownCode(cwd, 'unknown')}`] : []),
     '',
   ]
 

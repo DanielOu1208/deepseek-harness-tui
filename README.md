@@ -1,10 +1,34 @@
+<div align="center">
+
 # DeepSeek Harness TUI
+
+**A focused, terminal-native interface for the official DeepSeek Harness.**
+
+[![CI](https://github.com/DanielOu1208/deepseek-harness-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/DanielOu1208/deepseek-harness-tui/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/DanielOu1208/deepseek-harness-tui/actions/workflows/codeql.yml/badge.svg)](https://github.com/DanielOu1208/deepseek-harness-tui/actions/workflows/codeql.yml)
+[![Node.js 22.19+](https://img.shields.io/badge/Node.js-22.19%2B-3c873a?logo=nodedotjs&logoColor=white)](package.json)
+[![License: MIT](https://img.shields.io/badge/License-MIT-4d6bfe.svg)](LICENSE)
+
+<img src="docs/assets/tui-preview.svg" width="920" alt="Interface preview of DeepSeek Harness TUI showing settings, keyboard shortcuts, and context usage">
+
+<sub>Interface preview with sample data. The official Harness remains responsible for models, tools, permissions, sessions, and credentials.</sub>
+
+</div>
 
 A standalone terminal UI for the **official [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)**, rendered with [`@earendil-works/pi-tui`](https://www.npmjs.com/package/@earendil-works/pi-tui).
 
 This package does not fork or replace the Harness. The official runtime still owns the agent loop, models, tools, permissions, sessions, checkpoints, compaction, goals, skills, MCP, subagents, profiles, and credentials. This package adds the `deepseek` launcher, a Cordis profile bundle, and the terminal interaction layer.
 
 > **Status:** experimental MVP pinned to DeepSeek Harness `0.1.0-rc.6`. Keep the launcher and profile bundle on matching versions while the Harness is prerelease software.
+
+## Highlights
+
+| | |
+|---|---|
+| **Official runtime** | Adds a terminal interaction layer without forking the Harness agent loop or persistence model. |
+| **Fast controls** | Switch plan/build mode, reasoning effort, transcript detail, and permissions without leaving the composer. |
+| **Durable workflows** | Resume, rename, fork, archive, inspect, export, and organize sessions by workspace. |
+| **Visible state** | See the active model, reasoning level, permission mode, work status, and approximate context occupancy. |
 
 ## Requirements
 

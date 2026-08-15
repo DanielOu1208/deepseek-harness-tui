@@ -157,6 +157,23 @@ test('renders deterministic Markdown from projections and events', () => {
   assert.match(first, /Events: 2/)
 })
 
+test('renders untrusted session metadata in bounded Markdown code spans', () => {
+  const original = fixture()
+  const input = {
+    ...original,
+    header: {
+      ...original.header,
+      id: SessionId('session-`unsafe`'),
+      cwd: 'C:\\work\\`backticks`',
+    },
+  }
+
+  const output = renderSessionExportMarkdown(input)
+
+  assert.ok(output.includes('- Session: `` session-`unsafe` ``'))
+  assert.ok(output.includes('- Working directory: `` C:\\work\\`backticks` ``'))
+})
+
 test('sanitizes default filenames to one safe basename', () => {
   const filename = defaultSessionExportFilename({ id: SessionId('../../escape\\name\n'), createdAt: 0 }, 'markdown')
 
