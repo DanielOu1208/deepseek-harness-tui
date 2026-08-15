@@ -88,24 +88,29 @@ function isImageAttachmentRef(value: unknown): boolean {
 }
 
 function hasImageMediaType(record: Record<string, unknown>): boolean {
-  const mediaType = record.mediaType ?? record.mimeType
+  const mediaType = record.mediaType ?? record.mimeType ?? record.media_type ?? record.mime_type
   return typeof mediaType === 'string' && mediaType.toLowerCase().startsWith('image/')
 }
 
 function isAttachmentObject(record: Record<string, unknown>): boolean {
+  const type = typeof record.type === 'string' ? record.type.toLowerCase() : undefined
   return isImageAttachmentRef(record)
-    || (record.type === 'image' && isImageAttachmentRef(record.attachment))
+    || (type === 'image' && isImageAttachmentRef(record.attachment))
     || isImageAttachmentRef(record.ref)
-    || (record.type === 'image' && (hasImageMediaType(record) || 'data' in record || 'base64' in record))
+    || type === 'image'
+    || type === 'image_url'
+    || type === 'input_image'
+    || 'image_url' in record
+    || 'imageUrl' in record
     || (hasImageMediaType(record) && ('data' in record || 'base64' in record))
 }
 
 function isByteField(key: string, value: unknown, attachmentContext: boolean): boolean {
   if (isBinary(value)) return true
   const normalized = key.toLowerCase()
+  if (typeof value === 'string' && /^data:image\//iu.test(value)) return true
   if (!attachmentContext) return false
   if (BYTE_KEY.test(normalized)) return true
-  if (typeof value === 'string' && /^data:image\//iu.test(value)) return true
   if (normalized === 'data' && attachmentContext && (typeof value === 'string' || Array.isArray(value))) return true
   if (normalized === 'bytes' && attachmentContext && typeof value !== 'number') return true
   return false
@@ -116,7 +121,7 @@ function plainObject(value: object): Record<string, unknown> {
 }
 
 /**
- * Clone into canonical, lossless JSON while omitting attachment byte payloads.
+ * Clone into canonical, lossless JSON while omitting recognized image payloads.
  * Ref metadata (attachmentId, mediaType, dimensions, byte count, and name) is
  * retained. Object keys are sorted so all renderers receive deterministic data.
  */

@@ -134,7 +134,7 @@ Common local commands:
 | `/inspect` | Search model steps, tool calls, nested calls, timing, and errors |
 | `/stats` | Show whole-session timing and provider token/cache totals |
 | `/activity` | Inspect background jobs, workflows, and subagent descendants |
-| `/export [markdown\|json]` | Atomically export the current session without attachment bytes |
+| `/export [markdown\|json]` | Atomically export the current session with recognized image payloads removed |
 | `/stop` | Stop the active turn and keep the TUI open |
 | `/pause` | Stop, flush, print the resume ID, and exit |
 | `/exit` | Flush and exit |
@@ -149,7 +149,7 @@ Bare `/queue` can view pending work, replace text-only items in place, and remov
 
 Text drafts are saved per session under `$DSH_HOME/tui/drafts/v1` using owner-private files and restored during navigation. Pending images are intentionally not persisted. The TUI validates and stores images through the official attachment service, shows `[image]` in terminal history, and does not require terminal-specific inline graphics support.
 
-`/export` flushes the current session before writing an owner-private Markdown or versioned JSON file. Attachment references and metadata are preserved, but raw image bytes and encoded payloads are omitted. Exports can still contain sensitive prompts, tool output, and local paths.
+`/export` flushes the current session before writing an owner-private Markdown or versioned JSON file. Official image attachments, common `image`/`image_url` records, binary values, and `data:image` URLs have their raw or encoded payloads removed while reference metadata is preserved. Plugin event shapes are extensible, so always review an export before sharing it; exports can still contain sensitive prompts, tool output, local paths, and unrecognized plugin-defined data.
 
 `danger-full-access` permits unrestricted tool access. Use it only when the current session and working directory are trusted.
 

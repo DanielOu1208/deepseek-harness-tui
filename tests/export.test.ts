@@ -169,6 +169,34 @@ test('omits encoded payloads from plugin-style image records', () => {
   })
 })
 
+test('omits encoded payloads from nested provider image records', () => {
+  const input = fixture()
+  input.events[0] = {
+    seq: 0,
+    time: 1,
+    type: 'plugin/custom',
+    data: {
+      content: [
+        {
+          type: 'image_url',
+          image_url: { url: 'data:image/png;base64,URL_SECRET', detail: 'auto' },
+        },
+        {
+          type: 'image',
+          source: { type: 'base64', media_type: 'image/png', data: 'SOURCE_SECRET' },
+        },
+      ],
+    },
+  } as unknown as SessionEvent
+
+  const envelope = createSessionExport(input)
+  const images = (envelope.session.events[0] as { data: { content: Array<Record<string, unknown>> } }).data.content
+  assert.deepEqual(images, [
+    { image_url: { detail: 'auto' }, type: 'image_url' },
+    { source: { media_type: 'image/png', type: 'base64' }, type: 'image' },
+  ])
+})
+
 test('renders deterministic Markdown from projections and events', () => {
   const input = fixture()
   const first = renderSessionExportMarkdown(input)
