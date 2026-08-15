@@ -183,7 +183,7 @@ test('writes owner-private output atomically and refuses overwrite by default', 
 
   await writeSessionExport({ ...input, projections: { changed: true } }, destination, { overwrite: true })
   assert.match(await readFile(destination, 'utf8'), /"changed": true/)
-  assert.equal((await stat(destination)).mode & 0o777, 0o600)
+  if (process.platform !== 'win32') assert.equal((await stat(destination)).mode & 0o777, 0o600)
 })
 
 test('leaves no destination or temporary artifact after cancellation or staging failure', async () => {
