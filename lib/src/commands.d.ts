@@ -1,5 +1,85 @@
 import type { SlashCommand } from '@earendil-works/pi-tui';
-export type LocalCommandName = 'help' | 'new' | 'resume' | 'sessions' | 'session' | 'workspaces' | 'pause' | 'stop' | 'model' | 'models' | 'reasoning' | 'permission' | 'busy' | 'settings' | 'queue' | 'steer' | 'attach' | 'deliverables' | 'inspect' | 'stats' | 'activity' | 'export' | 'exit';
+declare const LOCAL_COMMAND_DEFINITIONS: readonly [{
+    readonly name: "exit";
+    readonly description: "Flush the session and exit";
+}, {
+    readonly name: "help";
+    readonly description: "Show TUI and official Harness commands";
+}, {
+    readonly name: "model";
+    readonly description: "Switch the model for the next request";
+    readonly argumentHint: "<provider>/<model>";
+}, {
+    readonly name: "models";
+    readonly description: "List available models";
+}, {
+    readonly name: "reasoning";
+    readonly description: "Select reasoning effort for the current model";
+    readonly argumentHint: "[default|effort]";
+}, {
+    readonly name: "new";
+    readonly description: "Start a fresh session";
+}, {
+    readonly name: "session";
+    readonly description: "Rename, fork, or archive a session";
+    readonly argumentHint: "[session-id]";
+}, {
+    readonly name: "workspaces";
+    readonly description: "Browse sessions grouped by workspace";
+}, {
+    readonly name: "pause";
+    readonly description: "Stop, persist, and exit with a resume ID";
+}, {
+    readonly name: "permission";
+    readonly description: "Set the tool permission mode";
+    readonly argumentHint: "<mode>";
+}, {
+    readonly name: "busy";
+    readonly description: "Choose what plain Enter does while the agent is busy";
+    readonly argumentHint: "[queue|steer]";
+}, {
+    readonly name: "settings";
+    readonly description: "Open the core TUI settings menu";
+}, {
+    readonly name: "queue";
+    readonly description: "Manage queued work or add a follow-up";
+    readonly argumentHint: "[prompt]";
+}, {
+    readonly name: "resume";
+    readonly description: "Search sessions or open one by ID";
+    readonly argumentHint: "[session-id]";
+}, {
+    readonly name: "sessions";
+    readonly description: "Search and switch sessions";
+}, {
+    readonly name: "steer";
+    readonly description: "Steer the nearest active agent step";
+    readonly argumentHint: "<prompt>";
+}, {
+    readonly name: "attach";
+    readonly description: "Attach an image to the next prompt";
+    readonly argumentHint: "[path]";
+}, {
+    readonly name: "deliverables";
+    readonly description: "Browse files produced by successful tools";
+}, {
+    readonly name: "inspect";
+    readonly description: "Inspect steps and tool calls";
+}, {
+    readonly name: "stats";
+    readonly description: "Show timing and token statistics";
+}, {
+    readonly name: "activity";
+    readonly description: "Show jobs, workflows, and subagents";
+}, {
+    readonly name: "export";
+    readonly description: "Export the current session";
+    readonly argumentHint: "[markdown|json]";
+}, {
+    readonly name: "stop";
+    readonly description: "Stop the active turn";
+}];
+export type LocalCommandName = (typeof LOCAL_COMMAND_DEFINITIONS)[number]['name'];
 export type ParsedInput = {
     kind: 'prompt';
     text: string;
@@ -22,4 +102,4 @@ export declare const LOCAL_SLASH_COMMANDS: readonly SlashCommand[];
 export declare function buildSlashCommands(harness: readonly HarnessCommandDescriptor[]): SlashCommand[];
 export declare function formatCommandHelp(commands: readonly SlashCommand[]): string;
 export declare function parseInput(input: string): ParsedInput;
-export declare const HELP_TEXT = "Local TUI commands:\n  /new                       start a fresh session\n  /sessions                  search and switch sessions\n  /session [session-id]      rename, fork, or archive a session\n  /workspaces                browse sessions grouped by workspace\n  /resume [session-id]       search sessions or open one by ID\n  /models                    list available models\n  /model <provider>/<model>  switch the next model request\n  /reasoning <effort>        select model reasoning effort\n  /permission <mode>         read-only | workspace-write | danger-full-access\n  /busy <queue|steer>        choose plain Enter behavior while busy\n  /settings                  open core TUI settings\n  /stop                      stop the active turn\n  /pause                     stop, flush, print the resume id, and exit\n  /steer <text>              steer the nearest agent step\n  /queue [text]              manage queued work or add a follow-up turn\n  /attach [path]             attach an image to the next prompt\n  /deliverables              browse files produced by successful tools\n  /inspect                   inspect steps and tool calls\n  /stats                     show timing and token statistics\n  /activity                  show jobs, workflows, and subagents\n  /export [markdown|json]    export the current session\n  /exit                      flush and exit\n\nOfficial Harness commands such as /compact, /goal, and /feedback are passed to ctx.commands.";
+export {};

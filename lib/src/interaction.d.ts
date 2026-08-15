@@ -62,7 +62,6 @@ export type ReasoningStepResult = {
 export declare function stepReasoningEffort(reasoning: ReasoningPickerSource, currentEffort: string | undefined, direction: ReasoningStepDirection): ReasoningStepResult;
 export declare function reasoningPickerItems(reasoning: ReasoningPickerSource): PickerItem[];
 export declare const BUSY_PICKER_ITEMS: readonly PickerItem[];
-export declare const SETTINGS_PICKER_ITEMS: readonly PickerItem[];
 export interface SettingsNamespacePickerSource {
     ns: string;
     applies: 'live' | 'restart';

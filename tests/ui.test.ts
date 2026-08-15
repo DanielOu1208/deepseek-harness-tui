@@ -479,6 +479,33 @@ test('routes mode and reasoning shortcuts without changing the composer draft', 
   ui.stop()
 })
 
+test('locks composer edits and submissions during a session transition while preserving Ctrl+C', () => {
+  const terminal = new FakeTerminal()
+  const ui = new DeepSeekTui(terminal)
+  const prompts: string[] = []
+  let interrupts = 0
+  ui.start({
+    onPrompt: text => { prompts.push(text) },
+    onSettings: () => {},
+    onInterrupt: () => { interrupts += 1 },
+    onExit: () => {},
+  })
+  ui.editor.setText('draft for current session')
+  ui.setComposerLocked(true)
+
+  for (const character of ' unsafe') terminal.send(character)
+  terminal.send('\r')
+  assert.equal(ui.getComposerText(), 'draft for current session')
+  assert.deepEqual(prompts, [])
+
+  terminal.send('\u0003')
+  assert.equal(interrupts, 1)
+  ui.setComposerLocked(false)
+  terminal.send('!')
+  assert.equal(ui.getComposerText(), 'draft for current session!')
+  ui.stop()
+})
+
 test('routes image paste without changing the draft and blocks it during dialogs', async () => {
   const terminal = new FakeTerminal()
   const ui = new DeepSeekTui(terminal)

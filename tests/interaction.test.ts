@@ -7,7 +7,6 @@ import {
   OTHER_ANSWER_VALUE,
   PERMISSION_PICKER_ITEMS,
   PLAN_PICKER_ITEMS,
-  SETTINGS_PICKER_ITEMS,
   filterPickerItems,
   modelPickerItems,
   parseModelRef,
@@ -20,6 +19,7 @@ import {
   settingsNamespacePickerItems,
   stepReasoningEffort,
 } from '../src/interaction.js'
+import { SETTINGS_PICKER_ITEMS } from '../src/settings-controller.js'
 
 test('parses provider/model while preserving slashes in model ids', () => {
   assert.deepEqual(parseModelRef('openai/gpt-5/codex'), { provider: 'openai', model: 'gpt-5/codex' })

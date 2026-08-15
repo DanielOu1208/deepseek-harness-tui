@@ -77,10 +77,12 @@ export declare class DeepSeekTui {
     private autocomplete?;
     private readonly ctrlCExit;
     private started;
+    private composerLocked;
     constructor(terminal?: Terminal);
     setSlashCommands(commands: readonly SlashCommand[], cwd: string): void;
     getComposerText(): string;
     setComposerText(text: string): void;
+    setComposerLocked(locked: boolean): void;
     copyToClipboard(text: string): void;
     setTranscriptDensity(density: TranscriptDensity): void;
     start(callbacks: TuiCallbacks): void;

@@ -802,6 +802,7 @@ export class DeepSeekTui {
   private autocomplete?: AutocompleteProvider
   private readonly ctrlCExit = new CtrlCExitGate()
   private started = false
+  private composerLocked = false
 
   constructor(terminal: Terminal = new ProcessTerminal()) {
     this.tui = new TuiAltScreen(terminal, false, undefined, { mouse: true })
@@ -843,6 +844,10 @@ export class DeepSeekTui {
     this.tui.requestRender()
   }
 
+  setComposerLocked(locked: boolean): void {
+    this.composerLocked = locked
+  }
+
   copyToClipboard(text: string): void {
     this.tui.terminal.write(`\u001b]52;c;${Buffer.from(text, 'utf8').toString('base64')}\u0007`)
     this.tui.flash('Copied to clipboard.', 1500)
@@ -864,7 +869,7 @@ export class DeepSeekTui {
     this.started = true
     this.callbacks = callbacks
     this.editor.onChange = () => {
-      if (this.pendingText !== undefined || callbacks.onDraftChange === undefined) return
+      if (this.composerLocked || this.pendingText !== undefined || callbacks.onDraftChange === undefined) return
       void Promise.resolve(callbacks.onDraftChange(this.editor.getExpandedText())).catch(error => this.flashError(error))
     }
     this.editor.onSubmit = (text) => {
@@ -877,10 +882,28 @@ export class DeepSeekTui {
         this.tui.requestRender()
         return
       }
+      if (this.composerLocked) {
+        this.tui.flash('Finish changing sessions before sending another message.', 2500)
+        return
+      }
       this.editor.addToHistory(text)
       void Promise.resolve(callbacks.onPrompt(text)).catch(error => this.flashError(error))
     }
     this.tui.addInputListener((data) => {
+      if (matchesKey(data, Key.ctrl('c'))) {
+        if (this.ctrlCExit.press() === 'exit') {
+          void Promise.resolve(callbacks.onExit()).catch(error => this.flashError(error))
+          return { consume: true }
+        }
+        this.activeInteraction?.cancel()
+        void Promise.resolve(callbacks.onInterrupt()).catch(error => this.flashError(error))
+        this.setStatus('Ctrl+C again to exit')
+        return { consume: true }
+      }
+      if (this.composerLocked) {
+        if (!isKeyRelease(data)) this.tui.flash('Changing sessions… Press Ctrl+C to cancel.', 1500)
+        return { consume: true }
+      }
       if (matchesKey(data, Key.ctrl('v')) && callbacks.onPasteImage !== undefined) {
         if (isKeyRelease(data)) return { consume: true }
         this.ctrlCExit.reset()
@@ -925,16 +948,6 @@ export class DeepSeekTui {
         } else {
           this.tui.flash('Finish the current dialog before opening Settings.', 2500)
         }
-        return { consume: true }
-      }
-      if (matchesKey(data, Key.ctrl('c'))) {
-        if (this.ctrlCExit.press() === 'exit') {
-          void Promise.resolve(callbacks.onExit()).catch(error => this.flashError(error))
-          return { consume: true }
-        }
-        this.activeInteraction?.cancel()
-        void Promise.resolve(callbacks.onInterrupt()).catch(error => this.flashError(error))
-        this.setStatus('Ctrl+C again to exit')
         return { consume: true }
       }
       if (matchesKey(data, Key.escape) && this.pendingText !== undefined) {

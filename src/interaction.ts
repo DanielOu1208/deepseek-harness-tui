@@ -169,21 +169,6 @@ export const BUSY_PICKER_ITEMS: readonly PickerItem[] = [
   { value: 'steer', label: 'Steer', description: 'Inject into the nearest active agent step' },
 ]
 
-export const SETTINGS_PICKER_ITEMS: readonly PickerItem[] = [
-  { value: 'summary', label: 'Current settings', description: 'Show active session and default values' },
-  { value: 'transcript-density', label: 'Transcript detail', description: 'Choose how much transcript detail to show' },
-  { value: 'model', label: 'Model', description: 'Switch provider and model' },
-  { value: 'reasoning', label: 'Reasoning effort', description: 'Select effort for the current model' },
-  { value: 'permission', label: 'Permission', description: 'Set this session’s tool-access preset' },
-  { value: 'busy', label: 'Busy Enter', description: 'Choose queue or steer while running' },
-  { value: 'save-model-default', label: 'Save model as default', description: 'Use this model and effort for future sessions' },
-  { value: 'save-permission-default', label: 'Save permission as default', description: 'Use this permission preset for future sessions' },
-  { value: 'providers', label: 'Providers', description: 'Inspect configured routes, models, and input capabilities' },
-  { value: 'runtime', label: 'Runtime', description: 'Inspect mounted Host plugins and configuration paths' },
-  { value: 'support', label: 'Support and feedback', description: 'Review disclosure and send Harness feedback' },
-  { value: 'advanced', label: 'Advanced runtime settings', description: 'Browse and patch registered Harness settings namespaces' },
-]
-
 export interface SettingsNamespacePickerSource {
   ns: string
   applies: 'live' | 'restart'
