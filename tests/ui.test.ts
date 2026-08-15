@@ -479,6 +479,30 @@ test('routes mode and reasoning shortcuts without changing the composer draft', 
   ui.stop()
 })
 
+test('routes image paste without changing the draft and blocks it during dialogs', async () => {
+  const terminal = new FakeTerminal()
+  const ui = new DeepSeekTui(terminal)
+  let pastes = 0
+  ui.start({
+    onPrompt: () => {},
+    onSettings: () => {},
+    onPasteImage: () => { pastes += 1 },
+    onInterrupt: () => {},
+    onExit: () => {},
+  })
+  ui.editor.setText('keep this draft')
+  terminal.send('\u0016')
+  assert.equal(pastes, 1)
+  assert.equal(ui.editor.getText(), 'keep this draft')
+
+  const dialog = ui.choose('Current dialog', [{ value: 'a', label: 'A' }])
+  terminal.send('\u0016')
+  assert.equal(pastes, 1)
+  terminal.send('\u001b')
+  assert.equal(await dialog, undefined)
+  ui.stop()
+})
+
 test('blocks mode and reasoning shortcuts while a dialog is active', async () => {
   const terminal = new FakeTerminal()
   const ui = new DeepSeekTui(terminal)
@@ -590,6 +614,34 @@ test('required prompts replace optional input and restore the original composer 
   ;(ui as unknown as { activeInteraction: { cancel(): void } }).activeInteraction.cancel()
   assert.equal(await required, undefined)
   assert.equal(ui.editor.getText(), 'composer draft')
+})
+
+test('text dialogs preserve expanded large-paste drafts without publishing an empty draft', async () => {
+  const terminal = new FakeTerminal()
+  const ui = new DeepSeekTui(terminal)
+  const draftChanges: string[] = []
+  ui.start({
+    onPrompt: () => {},
+    onDraftChange: text => { draftChanges.push(text) },
+    onSettings: () => {},
+    onInterrupt: () => {},
+    onExit: () => {},
+  })
+  const pasted = Array.from({ length: 12 }, (_, index) => `line ${String(index + 1)}`).join('\n')
+  terminal.send(`\u001b[200~${pasted}\u001b[201~`)
+  assert.match(ui.editor.getText(), /^\[paste #1 /u)
+  assert.equal(ui.getComposerText(), pasted)
+  assert.equal(draftChanges.at(-1), pasted)
+
+  const changesBeforeDialog = draftChanges.length
+  const prompt = ui.promptText('Temporary answer')
+  assert.equal(draftChanges.length, changesBeforeDialog)
+  terminal.send('\u001b')
+  assert.equal(await prompt, undefined)
+  assert.equal(ui.getComposerText(), pasted)
+  assert.equal(draftChanges.length, changesBeforeDialog)
+  assert.equal(draftChanges.includes(''), false)
+  ui.stop()
 })
 
 test('recognizes common terminal encodings for the settings key', () => {

@@ -774,6 +774,8 @@ interface PendingText {
 
 export interface TuiCallbacks {
   onPrompt(text: string): void | Promise<void>
+  onDraftChange?(text: string): void | Promise<void>
+  onPasteImage?(): void | Promise<void>
   onSettings(): void | Promise<void>
   onTogglePlanMode?(): void | Promise<void>
   onReasoningStep?(direction: 'increase' | 'decrease'): void | Promise<void>
@@ -831,6 +833,21 @@ export class DeepSeekTui {
     if (this.pendingText === undefined) this.editor.setAutocompleteProvider(this.autocomplete)
   }
 
+  getComposerText(): string {
+    return this.editor.getExpandedText()
+  }
+
+  setComposerText(text: string): void {
+    if (this.pendingText !== undefined) throw new Error('cannot replace the composer during a text prompt')
+    this.editor.setText(text)
+    this.tui.requestRender()
+  }
+
+  copyToClipboard(text: string): void {
+    this.tui.terminal.write(`\u001b]52;c;${Buffer.from(text, 'utf8').toString('base64')}\u0007`)
+    this.tui.flash('Copied to clipboard.', 1500)
+  }
+
   setTranscriptDensity(density: TranscriptDensity): void {
     if (density === this.transcriptDensity) return
     this.transcriptDensity = density
@@ -846,12 +863,15 @@ export class DeepSeekTui {
     if (this.started) return
     this.started = true
     this.callbacks = callbacks
+    this.editor.onChange = () => {
+      if (this.pendingText !== undefined || callbacks.onDraftChange === undefined) return
+      void Promise.resolve(callbacks.onDraftChange(this.editor.getExpandedText())).catch(error => this.flashError(error))
+    }
     this.editor.onSubmit = (text) => {
       if (text.trim() === '') return
       this.ctrlCExit.reset()
       if (this.pendingText !== undefined) {
         const pending = this.pendingText
-        this.pendingText = undefined
         pending.resolve(text)
         this.status.setNote('ready')
         this.tui.requestRender()
@@ -861,6 +881,16 @@ export class DeepSeekTui {
       void Promise.resolve(callbacks.onPrompt(text)).catch(error => this.flashError(error))
     }
     this.tui.addInputListener((data) => {
+      if (matchesKey(data, Key.ctrl('v')) && callbacks.onPasteImage !== undefined) {
+        if (isKeyRelease(data)) return { consume: true }
+        this.ctrlCExit.reset()
+        if (this.activeInteraction !== undefined) {
+          this.tui.flash('Finish the current dialog before attaching an image.', 2500)
+        } else {
+          void Promise.resolve(callbacks.onPasteImage()).catch(error => this.flashError(error))
+        }
+        return { consume: true }
+      }
       const togglePlan = matchesKey(data, Key.shift(Key.tab))
       let reasoningDirection: 'increase' | 'decrease' | undefined
       if (matchesKey(data, Key.shift(Key.up))) reasoningDirection = 'increase'
@@ -1158,18 +1188,16 @@ export class DeepSeekTui {
     if (signal?.aborted) return undefined
     const priority = options.priority ?? 'optional'
     this.prepareInteraction(priority)
-    const draft = this.editor.getText()
-    this.editor.setText('')
-    this.editor.setAutocompleteProvider(disabledAutocomplete)
+    const draft = this.editor.getExpandedText()
     return await new Promise<string | undefined>((resolve) => {
       let settled = false
       const settle = (value: string | undefined): void => {
         if (settled) return
         settled = true
         signal?.removeEventListener('abort', abort)
-        if (this.pendingText === pending) this.pendingText = undefined
         this.closeInteraction(interaction)
         this.editor.setText(draft)
+        if (this.pendingText === pending) this.pendingText = undefined
         if (this.autocomplete !== undefined) this.editor.setAutocompleteProvider(this.autocomplete)
         resolve(value)
       }
@@ -1186,6 +1214,8 @@ export class DeepSeekTui {
         cancel: () => settle(undefined),
       }
       this.pendingText = pending
+      this.editor.setText('')
+      this.editor.setAutocompleteProvider(disabledAutocomplete)
       this.openInteraction(title, this.editor, 'Type your answer · Enter submit · Esc close', interaction, false)
       signal?.addEventListener('abort', abort, { once: true })
       this.tui.setFocus(this.editor)

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { resolve } from 'node:path'
+import { readFile, stat } from 'node:fs/promises'
+import { basename, join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/cordis-plugin-loader'
 import {
@@ -11,11 +12,19 @@ import {
 } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type {} from '@deepseek-ai/dsh-cmdline'
+import type { SaveImageAttachment } from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-commands'
 import type {} from '@deepseek-ai/dsh-plan-mode'
 import type {} from '@deepseek-ai/dsh-session-projection'
+import type {} from '@deepseek-ai/dsh-session-stats'
 import type {} from '@deepseek-ai/dsh-token-meter'
-import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import type {} from '@deepseek-ai/dsh-workspace'
+import type {} from '@deepseek-ai/dsh-host-plugin-inventory'
+import type { PluginInventorySnapshot } from '@deepseek-ai/dsh-host-plugin-inventory/types'
+import type {} from '@deepseek-ai/dsh-jobs'
+import type {} from '@deepseek-ai/dsh-subagent'
+import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+import { createUserMessage, ReasoningEffortId, type UserMessage } from '@deepseek-ai/dsh-llm'
 import { PERMISSION_SETTINGS_NAMESPACE } from '@deepseek-ai/dsh-permission-presets'
 import type { SessionPersistenceSnapshot } from '@deepseek-ai/dsh-session-persistence'
 import { foldSessionTitle } from '@deepseek-ai/dsh-session-title'
@@ -29,6 +38,16 @@ import type {
   AskUserQuestionRequest,
 } from '@deepseek-ai/dsh-user-questions'
 import { buildSlashCommands, formatCommandHelp, parseInput } from './commands.js'
+import { projectWorkflowActivity } from './activity.js'
+import { detectImageMediaType, readClipboardImage } from './clipboard-image.js'
+import { deliverableBasename, deriveDeliverables, type PresentedToolMutation } from './deliverables.js'
+import { createSessionDraftStore, type SessionDraftStoreLike } from './drafts.js'
+import {
+  defaultSessionExportFilename,
+  SESSION_EXPORT_DISCLOSURE,
+  writeSessionExport,
+  type SessionExportFormat,
+} from './export.js'
 import {
   BUSY_PICKER_ITEMS,
   GOAL_PICKER_ITEMS,
@@ -51,7 +70,10 @@ import {
   type ReasoningStepDirection,
   type SessionPickerSource,
 } from './interaction.js'
-import { createProjection, foldSessionEvent, type ProjectionState, type ToolPresenter } from './projection.js'
+import { createProjection, foldSessionEvent, projectSession, type ProjectionState, type ToolPresenter } from './projection.js'
+import { openExternalPath } from './platform.js'
+import { queueItemLabel, queueItems, type QueueItemView } from './queue.js'
+import { projectVisibility, type VisibilitySnapshot, type VisibilityToolRecord } from './visibility.js'
 import type { TuiStartupOptions } from './startup.js'
 import {
   DEFAULT_TRANSCRIPT_DENSITY,
@@ -66,15 +88,21 @@ import { DeepSeekTui, sanitizeTerminalText } from './ui.js'
 export const name = 'dsh-tui-runner'
 export const inject = [
   'dshTuiStartup',
+  'attachments',
   'agentDefaultModel',
   'agents',
   'sessions',
   'sessionPersistence',
+  'sessionTitle',
   'commands',
   'planMode',
   'permissionPresets',
   'sessionProjections',
   'tokenMeter',
+  'workspaceRegistry',
+  'pluginInventory',
+  'jobs',
+  'subagents',
   'settings',
   'tools',
   'llm',
@@ -130,6 +158,17 @@ function updatedAt(events: readonly SessionEvent[], createdAt: number): number {
   return events.at(-1)?.time ?? createdAt
 }
 
+function formatDuration(milliseconds: number | undefined): string {
+  if (milliseconds === undefined) return 'n/a'
+  if (milliseconds < 1_000) return `${String(Math.round(milliseconds))}ms`
+  if (milliseconds < 60_000) return `${(milliseconds / 1_000).toFixed(milliseconds < 10_000 ? 2 : 1)}s`
+  return `${(milliseconds / 60_000).toFixed(1)}m`
+}
+
+function formatTokenCount(tokens: number): string {
+  return new Intl.NumberFormat('en-US').format(tokens)
+}
+
 interface PreparedSession {
   handle: AgentHandle
   selection: ModelSelectionRef
@@ -152,6 +191,9 @@ export class DshTuiRunner {
   private actionQueue: Promise<void> = Promise.resolve()
   private sessionGeneration = 0
   private sessionLoadAbort?: AbortController
+  private activityLoadAbort?: AbortController
+  private draftSaveTimer?: ReturnType<typeof setTimeout>
+  private pendingImages: SaveImageAttachment[] = []
   private readonly sessionNavigatorCache = new Map<string, { revision: string; source: SessionPickerSource }>()
 
   constructor(
@@ -159,6 +201,9 @@ export class DshTuiRunner {
     private readonly startup: TuiStartupOptions,
     private readonly ui = new DeepSeekTui(),
     private readonly transcriptSettings?: SettingsScope<TranscriptSettings>,
+    private readonly draftStore: SessionDraftStoreLike = createSessionDraftStore(
+      join(resolveDshHome(), 'tui', 'drafts', 'v1'),
+    ),
   ) {
     if (this.transcriptSettings !== undefined) {
       this.ui.setTranscriptDensity(this.transcriptSettings.get().transcriptDensity)
@@ -182,12 +227,15 @@ export class DshTuiRunner {
     if (this.closing) return
     this.installInteractions()
     await this.open(this.startup.resume)
+    await this.restoreCurrentDraft()
     this.ui.appendLaunchBanner(
       String(this.agent.id),
       this.agent.session.header.cwd ?? resolve(this.startup.cwd ?? process.cwd()),
     )
     this.ui.start({
       onPrompt: text => this.submit(text),
+      onDraftChange: text => this.scheduleDraftSave(text),
+      onPasteImage: () => this.enqueueAction(() => this.pasteClipboardImage()),
       onSettings: () => this.enqueueAction(() => this.chooseSettings()),
       onTogglePlanMode: () => this.enqueueAction(() => this.enqueueShortcut(() => this.togglePlanMode())),
       onReasoningStep: direction => this.enqueueAction(() => this.enqueueShortcut(() => this.stepReasoning(direction))),
@@ -316,6 +364,18 @@ export class DshTuiRunner {
 
   private async open(resumeId?: string, fallbackSelection?: ModelSelection): Promise<void> {
     this.activateSession(await this.prepareSession(resumeId, fallbackSelection))
+    await this.attachCurrentWorkspace()
+  }
+
+  private async attachCurrentWorkspace(): Promise<void> {
+    const cwd = this.agent.session.header.cwd
+    if (cwd === undefined) return
+    try {
+      const workspace = await this.ctx.workspaceRegistry.create(cwd)
+      await workspace.attachSession(this.agent.session.id)
+    } catch {
+      // A missing historical directory must not prevent its session from opening.
+    }
   }
 
   private bindAgent(agent: Agent): void {
@@ -348,6 +408,15 @@ export class DshTuiRunner {
         case 'resume':
           command.getArgumentCompletions = async prefix =>
             filterPickerItems(await this.loadSessionPickerItems(), prefix)
+          break
+        case 'session':
+          command.getArgumentCompletions = async prefix =>
+            filterPickerItems(await this.loadSessionPickerItems(), prefix)
+          break
+        case 'sessions':
+          command.getArgumentCompletions = prefix => filterPickerItems([
+            { value: 'archived', label: 'archived', description: 'Browse one-way archived sessions' },
+          ], prefix)
           break
         case 'permission':
           command.getArgumentCompletions = prefix =>
@@ -454,6 +523,157 @@ export class DshTuiRunner {
     return queued
   }
 
+  private cancelDraftSave(): void {
+    if (this.draftSaveTimer === undefined) return
+    clearTimeout(this.draftSaveTimer)
+    this.draftSaveTimer = undefined
+  }
+
+  private scheduleDraftSave(text: string): void {
+    if (this.handle === undefined || this.closing) return
+    const sessionId = String(this.agent.id)
+    this.cancelDraftSave()
+    this.draftSaveTimer = setTimeout(() => {
+      this.draftSaveTimer = undefined
+      void this.draftStore.save(sessionId, text).catch(error => this.ui.flashError(error))
+    }, 150)
+  }
+
+  private composerText(): string | undefined {
+    const getComposerText = (this.ui as DeepSeekTui & { getComposerText?: () => string }).getComposerText
+    return typeof getComposerText === 'function' ? getComposerText.call(this.ui) : undefined
+  }
+
+  private replaceComposerText(text: string): void {
+    const setComposerText = (this.ui as DeepSeekTui & { setComposerText?: (value: string) => void }).setComposerText
+    if (typeof setComposerText === 'function') setComposerText.call(this.ui, text)
+  }
+
+  private async persistCurrentDraft(text = this.composerText()): Promise<void> {
+    if (this.handle === undefined) return
+    if (text === undefined) return
+    this.cancelDraftSave()
+    await this.draftStore.save(String(this.agent.id), text)
+  }
+
+  private async restoreCurrentDraft(): Promise<void> {
+    if (this.handle === undefined) return
+    if (this.composerText() === undefined) return
+    this.cancelDraftSave()
+    this.replaceComposerText(await this.draftStore.load(String(this.agent.id)) ?? '')
+  }
+
+  private async addPendingImage(input: SaveImageAttachment): Promise<void> {
+    const limits = this.ctx.attachments.imageLimits
+    if (this.pendingImages.length >= limits.maxImagesPerMessage) {
+      throw new Error(`a prompt can contain at most ${limits.maxImagesPerMessage} images`)
+    }
+    const total = this.pendingImages.reduce((sum, image) => sum + image.data.byteLength, 0) + input.data.byteLength
+    if (total > limits.maxMessageImageBytes) {
+      throw new Error(`pending images exceed the ${limits.maxMessageImageBytes}-byte message limit`)
+    }
+    await this.ctx.attachments.validateImage(input)
+    this.pendingImages.push(input)
+    this.ui.appendNotice(`[image] ${input.name ?? 'attachment'} · ${input.mediaType} · ${input.data.byteLength} bytes`)
+    this.ui.setStatus(`${this.pendingImages.length} image${this.pendingImages.length === 1 ? '' : 's'} attached to the next prompt`)
+  }
+
+  private async attachImagePath(path: string): Promise<void> {
+    const cwd = this.agent.session.header.cwd ?? resolve(this.startup.cwd ?? process.cwd())
+    const absolute = resolve(cwd, path)
+    const metadata = await stat(absolute)
+    if (!metadata.isFile()) throw new Error(`attachment is not a file: ${path}`)
+    if (metadata.size > this.ctx.attachments.imageLimits.maxImageBytes) {
+      throw new Error(`image exceeds the ${this.ctx.attachments.imageLimits.maxImageBytes}-byte limit`)
+    }
+    const data = new Uint8Array(await readFile(absolute))
+    const mediaType = detectImageMediaType(data)
+    if (mediaType === undefined) throw new Error('unsupported image; use PNG, JPEG, WebP, or GIF')
+    await this.addPendingImage({ data, mediaType, name: basename(absolute) })
+  }
+
+  private async pasteClipboardImage(): Promise<void> {
+    this.ui.setStatus('reading image from clipboard…')
+    const image = await readClipboardImage()
+    if (image === undefined) {
+      this.ui.appendNotice('No supported clipboard image was available. Use /attach <path> as a fallback.')
+      this.ui.setStatus('ready')
+      return
+    }
+    await this.addPendingImage(image)
+  }
+
+  private async chooseAttachments(path = ''): Promise<void> {
+    if (path.trim() !== '') {
+      await this.attachImagePath(path.trim())
+      return
+    }
+    if (this.pendingImages.length === 0) {
+      const entered = await this.ui.promptText('Image path (PNG, JPEG, WebP, or GIF):')
+      if (entered?.trim()) await this.attachImagePath(entered.trim())
+      return
+    }
+    const items = [
+      ...this.pendingImages.map((image, index) => ({
+        value: `remove:${index}`,
+        label: `[image] ${image.name ?? `attachment ${index + 1}`}`,
+        description: `${image.mediaType} · ${image.data.byteLength} bytes · select to remove`,
+      })),
+      { value: 'add', label: 'Attach another image…', description: 'Read an image file from the workspace' },
+      { value: 'clear', label: 'Remove all images', description: 'Clear pending image attachments' },
+    ]
+    const choice = await this.ui.choose('Pending images', items)
+    if (choice === undefined) return
+    if (choice.value === 'add') {
+      const entered = await this.ui.promptText('Image path (PNG, JPEG, WebP, or GIF):')
+      if (entered?.trim()) await this.attachImagePath(entered.trim())
+      return
+    }
+    if (choice.value === 'clear') this.pendingImages = []
+    else {
+      const index = Number(choice.value.slice('remove:'.length))
+      if (Number.isInteger(index)) this.pendingImages.splice(index, 1)
+    }
+    this.ui.setStatus(this.pendingImages.length === 0
+      ? 'pending images cleared'
+      : `${this.pendingImages.length} image${this.pendingImages.length === 1 ? '' : 's'} attached to the next prompt`)
+  }
+
+  private async promptMessage(text: string): Promise<UserMessage> {
+    if (this.pendingImages.length === 0) return message(text)
+    const selection = this.selection?.current
+    if (selection === undefined) throw new Error('model selection is unavailable')
+    const info = await this.ctx.llm.resolveModelInfo(selection.provider, selection.model)
+    if (info.inputModalities !== undefined && !info.inputModalities.includes('image')) {
+      throw new Error(`the current model ${selection.provider}/${selection.model} does not accept image input`)
+    }
+    await Promise.all(this.pendingImages.map(image => this.ctx.attachments.validateImage(image)))
+    const refs = []
+    for (const image of this.pendingImages) refs.push(await this.ctx.attachments.saveImage(image))
+    return createUserMessage({
+      content: [
+        { type: 'text' as const, text },
+        ...refs.map(attachment => ({ type: 'image' as const, attachment })),
+      ],
+      source: { kind: 'user' as const },
+    })
+  }
+
+  private async confirmDiscardPendingImages(): Promise<boolean> {
+    if (this.pendingImages.length === 0) return true
+    const choice = await this.ui.choose(
+      `Discard ${this.pendingImages.length} unsent image${this.pendingImages.length === 1 ? '' : 's'} and change sessions?`,
+      [
+        { value: 'keep', label: 'Stay here', description: 'Keep the pending images' },
+        { value: 'discard', label: 'Discard and switch', description: 'Unsent image drafts are temporary' },
+      ],
+      undefined,
+      { initialValue: 'keep' },
+    )
+    if (choice?.value !== 'discard') return false
+    return true
+  }
+
   private async togglePlanMode(): Promise<void> {
     const handle = this.handle
     if (handle === undefined) throw new Error('no active DeepSeek session')
@@ -521,16 +741,32 @@ export class DshTuiRunner {
     if (this.closing || raw.trim() === '') return
     const input = parseInput(raw)
     if (input.kind === 'prompt') {
-      if (this.agent.status === 'running') {
-        if (this.busyEnter === 'steer') {
-          this.agent.steer(message(input.text))
-          this.ui.setStatus('steering queued for the next step')
+      const sessionId = String(this.agent.id)
+      this.cancelDraftSave()
+      await this.draftStore.save(sessionId, input.text)
+      try {
+        const outgoing = await this.promptMessage(input.text)
+        if (this.agent.status === 'running') {
+          if (this.busyEnter === 'steer') {
+            this.agent.steer(outgoing)
+            this.ui.setStatus('steering queued for the next step')
+          } else {
+            this.agent.followup(outgoing)
+            this.ui.setStatus('follow-up queued after the active turn')
+          }
         } else {
-          this.agent.followup(message(input.text))
-          this.ui.setStatus('follow-up queued after the active turn')
+          this.agent.followup(outgoing)
         }
-      } else {
-        this.agent.followup(message(input.text))
+        this.pendingImages = []
+        const nextDraft = this.composerText() ?? ''
+        if (nextDraft === '') await this.draftStore.delete(sessionId)
+        else await this.draftStore.save(sessionId, nextDraft)
+      } catch (error) {
+        const newerText = this.composerText() ?? ''
+        const restored = newerText === '' ? input.text : `${input.text}\n${newerText}`
+        this.replaceComposerText(restored)
+        await this.draftStore.save(sessionId, restored)
+        throw error
       }
       return
     }
@@ -569,7 +805,19 @@ export class DshTuiRunner {
         else await this.requestSessionSwitch(input.argument)
         return
       case 'sessions':
-        await this.chooseSession()
+        if (input.argument !== '' && input.argument !== 'archived') throw new Error('usage: /sessions [archived]')
+        await this.chooseSession(input.argument === 'archived')
+        return
+      case 'session':
+        if (input.argument !== '' && input.argument !== String(this.agent.id)) {
+          await this.requestSessionSwitch(input.argument)
+          if (String(this.agent.id) !== input.argument) return
+        }
+        await this.chooseSessionAction()
+        return
+      case 'workspaces':
+        if (input.argument !== '') throw new Error('usage: /workspaces')
+        await this.chooseWorkspace()
         return
       case 'models':
         await this.showModels()
@@ -591,14 +839,34 @@ export class DshTuiRunner {
         await this.chooseSettings(input.argument)
         return
       case 'queue':
-        if (input.argument === '') throw new Error('usage: /queue <prompt>')
-        this.agent.followup(message(input.argument))
-        this.ui.setStatus('follow-up queued')
+        if (input.argument === '') await this.chooseQueueManager()
+        else {
+          this.agent.followup(message(input.argument))
+          this.ui.setStatus('follow-up queued')
+        }
         return
       case 'steer':
         if (input.argument === '') throw new Error('usage: /steer <prompt>')
         this.agent.steer(message(input.argument))
         this.ui.setStatus('steering queued')
+        return
+      case 'attach':
+        await this.chooseAttachments(input.argument)
+        return
+      case 'deliverables':
+        await this.chooseDeliverable()
+        return
+      case 'inspect':
+        await this.chooseInspectorEntry()
+        return
+      case 'stats':
+        this.showSessionStats()
+        return
+      case 'activity':
+        await this.showActivity()
+        return
+      case 'export':
+        await this.exportSession(input.argument)
         return
     }
   }
@@ -620,10 +888,380 @@ export class DshTuiRunner {
     if (generation === this.sessionGeneration && this.handle?.agent === agent) this.refresh()
   }
 
+  private findQueuedMessage(item: QueueItemView) {
+    return [...this.agent.inbox.nextStep, ...this.agent.inbox.nextTurn]
+      .find(candidate => String(candidate.id) === item.id)
+  }
+
+  private async chooseQueueManager(): Promise<void> {
+    while (!this.closing) {
+      const items = queueItems(this.agent.inbox.nextStep, this.agent.inbox.nextTurn)
+      if (items.length === 0) {
+        this.ui.appendNotice('Queue is empty. Use /queue <prompt> to add a follow-up turn.')
+        return
+      }
+      const choice = await this.ui.chooseSearchable('Queued work', items.map(item => ({
+        value: item.id,
+        label: queueItemLabel(item),
+        description: `${item.placement === 'next-step' ? 'Steer' : 'Follow-up'} · ${item.id}${item.editable ? '' : ' · image message'}`,
+        searchText: `${item.id} ${item.text}`,
+      })))
+      if (choice === undefined) return
+      const selected = items.find(item => item.id === choice.value)
+      if (selected === undefined || this.findQueuedMessage(selected) === undefined) {
+        this.ui.flashStatus('That queue item is no longer pending.')
+        continue
+      }
+      const actions = [
+        ...(selected.editable
+          ? [{ value: 'edit', label: 'Edit text…', description: 'Replace this queued message in place' }]
+          : []),
+        { value: 'remove', label: 'Remove', description: 'Cancel this queued message' },
+        { value: 'back', label: 'Back', description: 'Return to the queue' },
+      ]
+      const action = await this.ui.choose('Queue item', actions, undefined, { initialValue: 'back' })
+      if (action === undefined || action.value === 'back') continue
+      if (action.value === 'edit') {
+        const text = await this.ui.promptText('Replacement queue text:')
+        if (text === undefined || text.trim() === '') continue
+        if (!this.agent.inbox.replace(selected.id as never, message(text.trim()))) {
+          this.ui.flashStatus('That queue item was already claimed or removed.')
+        } else {
+          this.ui.setStatus('queued message updated')
+        }
+        continue
+      }
+      const confirmation = await this.ui.choose('Remove this queued message?', [
+        { value: 'cancel', label: 'Cancel', description: 'Keep the message queued' },
+        { value: 'remove', label: 'Remove message', description: 'This cannot be undone' },
+      ], undefined, { initialValue: 'cancel' })
+      if (confirmation?.value !== 'remove') continue
+      if (!this.agent.inbox.remove(selected.id as never)) {
+        this.ui.flashStatus('That queue item was already claimed or removed.')
+      } else {
+        this.ui.setStatus('queued message removed')
+      }
+    }
+  }
+
+  private presentedToolMutations(): PresentedToolMutation[] {
+    const calls = new Map<string, Extract<SessionEvent, { type: 'tool/call' }>>()
+    const output: PresentedToolMutation[] = []
+    for (const event of this.agent.session.events) {
+      if (event.type === 'tool/call') {
+        calls.set(String(event.data.callId), event)
+        continue
+      }
+      if (event.type !== 'tool/result') continue
+      const block = event.data.message.content[0]
+      const call = block?.type === 'tool-result' ? calls.get(String(block.toolCallId)) : undefined
+      if (call === undefined) continue
+      let argumentsValue: unknown = call.data.arguments
+      try { argumentsValue = JSON.parse(call.data.arguments) } catch {}
+      const callView = this.ctx.tools.get(call.data.name, this.agent)?.presentCall?.(argumentsValue)
+      output.push({
+        seq: event.seq,
+        turn: event.data.turn,
+        failed: event.data.error !== undefined || (block?.type === 'tool-result' && block.isError === true),
+        ...(callView === undefined ? {} : { callView }),
+      })
+    }
+    return output
+  }
+
+  private async chooseDeliverable(): Promise<void> {
+    const deliverables = deriveDeliverables(this.presentedToolMutations())
+    if (deliverables.length === 0) {
+      this.ui.appendNotice('No successful mutation tools have reported produced files in this session.')
+      return
+    }
+    const choice = await this.ui.chooseSearchable('Produced files', deliverables.map(item => ({
+      value: item.path,
+      label: deliverableBasename(item.path),
+      description: `turn ${item.turn} · ${item.path}`,
+      searchText: item.path,
+    })))
+    if (choice === undefined) return
+    const cwd = this.agent.session.header.cwd ?? resolve(this.startup.cwd ?? process.cwd())
+    const absolute = resolve(cwd, choice.value)
+    const action = await this.ui.choose(choice.value, [
+      { value: 'copy', label: 'Copy path', description: absolute },
+      { value: 'open', label: 'Open externally', description: 'Use the operating system’s default application' },
+      { value: 'cancel', label: 'Cancel' },
+    ], undefined, { initialValue: 'cancel' })
+    if (action?.value === 'copy') {
+      this.ui.copyToClipboard(absolute)
+      return
+    }
+    if (action?.value === 'open') {
+      const metadata = await stat(absolute)
+      if (!metadata.isFile()) throw new Error(`deliverable is not a file: ${choice.value}`)
+      await openExternalPath(absolute)
+      this.ui.setStatus(`opened ${choice.value}`)
+    }
+  }
+
+  private visibilitySnapshot(): VisibilitySnapshot {
+    return projectVisibility(this.agent.session.events, String(this.agent.id))
+  }
+
+  private inspectorToolDetail(tool: VisibilityToolRecord): string {
+    return [
+      `${tool.kind === 'subtool' ? 'Nested tool' : 'Tool'} · ${tool.name}`,
+      `- Call: ${tool.callId}`,
+      `- Status: ${tool.status}`,
+      `- Turn/step: ${tool.turn === undefined ? 'n/a' : String(tool.turn)}/${tool.step === undefined ? 'n/a' : String(tool.step)}`,
+      `- Started: ${new Date(tool.startedAt).toLocaleString()} · seq ${String(tool.startSeq)}`,
+      `- Duration: ${formatDuration(tool.durationMs)}`,
+      ...(tool.parentCallId === undefined ? [] : [`- Parent call: ${tool.parentCallId}`]),
+      ...(tool.rootCallId === undefined ? [] : [`- Root call: ${tool.rootCallId}`]),
+      ...(tool.argumentsText === undefined ? [] : ['', 'Arguments', tool.argumentsText]),
+      ...(tool.resultText === undefined ? [] : ['', tool.resultIsError === true ? 'Error result' : 'Result', tool.resultText]),
+      ...(tool.resultMetaText === undefined ? [] : ['', 'Result metadata', tool.resultMetaText]),
+    ].join('\n')
+  }
+
+  private async chooseInspectorEntry(): Promise<void> {
+    const snapshot = this.visibilitySnapshot()
+    const choices: PickerItem[] = [
+      ...snapshot.tools.map((tool, index) => ({
+        value: `tool:${String(index)}`,
+        label: `${tool.kind === 'subtool' ? '↳ ' : ''}${tool.name}`,
+        description: `${tool.status} · ${formatDuration(tool.durationMs)} · call ${tool.callId}`,
+        searchText: [tool.name, tool.callId, tool.argumentsText, tool.resultText].filter(Boolean).join(' '),
+      })).reverse(),
+      ...snapshot.steps.map((step, index) => ({
+        value: `step:${String(index)}`,
+        label: `Turn ${String(step.turn)} · step ${String(step.step)}`,
+        description: `${step.status} · model ${formatDuration(step.modelMs)} · first token ${formatDuration(step.ttftMs)}`,
+      })).reverse(),
+    ]
+    if (choices.length === 0) {
+      this.ui.appendNotice('No model steps or tool calls have been recorded in this session.')
+      return
+    }
+    const choice = await this.ui.chooseSearchable('Session inspector', choices)
+    if (choice === undefined) return
+    const [kind, rawIndex] = choice.value.split(':')
+    const index = Number(rawIndex)
+    if (kind === 'tool') {
+      const tool = snapshot.tools[index]
+      if (tool !== undefined) this.ui.appendNotice(this.inspectorToolDetail(tool))
+      return
+    }
+    const step = snapshot.steps[index]
+    if (step === undefined) return
+    this.ui.appendNotice([
+      `Turn ${String(step.turn)} · step ${String(step.step)}`,
+      `- Status: ${step.status}`,
+      `- Started: ${new Date(step.startedAt).toLocaleString()} · seq ${String(step.startSeq)}`,
+      `- Model time: ${formatDuration(step.modelMs)}`,
+      `- First token: ${formatDuration(step.ttftMs)}`,
+      `- Decode: ${formatDuration(step.decodeMs)}`,
+      `- Output tokens: ${step.outputTokens === undefined ? 'n/a' : formatTokenCount(step.outputTokens)}`,
+    ].join('\n'))
+  }
+
+  private showSessionStats(): void {
+    const visibility = this.visibilitySnapshot()
+    const official = this.ctx.sessionProjections.snapshot(this.agent.session).values.sessionStats
+    const timing = official ?? visibility.timing
+    const tokens = visibility.tokens
+    const averageTtft = timing.ttftSteps === 0 ? undefined : timing.ttftMs / timing.ttftSteps
+    const decodeRate = timing.decodeMs === 0 ? undefined : timing.decodeTokens / (timing.decodeMs / 1_000)
+    this.ui.appendNotice([
+      'Session statistics',
+      `- Turns / steps: ${String(timing.turns)} / ${String(timing.steps)}`,
+      `- Model / tool time: ${formatDuration(timing.llmMs)} / ${formatDuration(timing.toolMs)}`,
+      `- Average first-token latency: ${formatDuration(averageTtft)}`,
+      `- Decode: ${formatDuration(timing.decodeMs)} · ${decodeRate === undefined ? 'n/a' : `${decodeRate.toFixed(1)} tokens/s`}`,
+      `- Nested Code Mode tool time: ${formatDuration(visibility.timing.subtoolMs)}`,
+      '',
+      'Provider-reported tokens',
+      `- Uncached input: ${formatTokenCount(tokens.uncachedInputTokens)}`,
+      `- Cache read: ${formatTokenCount(tokens.cacheReadTokens)}`,
+      `- Cache write: ${formatTokenCount(tokens.cacheWriteTokens)}`,
+      `- Output: ${formatTokenCount(tokens.outputTokens)}`,
+    ].join('\n'))
+  }
+
+  private async showActivity(): Promise<void> {
+    const category = await this.ui.choose('Session activity', [
+      { value: 'jobs', label: 'Background jobs', description: 'Process-local work visible to this session' },
+      { value: 'workflows', label: 'Workflows', description: 'Durable workflow runs recorded in this session' },
+      { value: 'subagents', label: 'Subagents', description: 'Durable descendant sessions and current residency' },
+    ])
+    if (category === undefined) return
+    if (category.value === 'jobs') {
+      const jobs = this.ctx.jobs.list(this.agent)
+      if (jobs.length === 0) {
+        this.ui.appendNotice('No background jobs are registered for this session.\n\nJob state is process-local and is not restored after the Harness exits.')
+        return
+      }
+      const choice = await this.ui.chooseSearchable('Background jobs', jobs.map((job, index) => ({
+        value: String(index),
+        label: `${job.id} · ${job.label}`,
+        description: `${job.status}${job.detail === undefined ? '' : ` · ${job.detail}`}`,
+        searchText: `${job.id} ${job.kind} ${job.label} ${job.status} ${job.detail ?? ''}`,
+      })))
+      const job = choice === undefined ? undefined : jobs[Number(choice.value)]
+      if (job !== undefined) {
+        this.ui.appendNotice([
+          `${job.id} · ${job.label}`,
+          `- Kind / status: ${job.kind} / ${job.status}`,
+          `- Started: ${new Date(job.startedAt).toLocaleString()}`,
+          ...(job.finishedAt === undefined ? [] : [`- Finished: ${new Date(job.finishedAt).toLocaleString()}`]),
+          ...(job.detail === undefined ? [] : [`- Detail: ${job.detail}`]),
+          `- Reported: ${job.reported ? 'yes' : 'no'}`,
+          '',
+          'Job state is process-local. This inspector does not consume job output or change its reported state.',
+        ].join('\n'))
+      }
+      return
+    }
+    if (category.value === 'workflows') {
+      const workflows = projectWorkflowActivity(this.agent.session.events)
+      if (workflows.length === 0) {
+        this.ui.appendNotice('No durable workflow runs have been recorded in this session.')
+        return
+      }
+      const choice = await this.ui.chooseSearchable('Workflow runs', workflows.map((workflow, index) => ({
+        value: String(index),
+        label: workflow.name,
+        description: `${workflow.stopReason ?? 'active/incomplete'} · ${String(workflow.members.length)} agents · ${workflow.id}`,
+        searchText: `${workflow.name} ${workflow.id} ${workflow.members.map(member => member.label).join(' ')}`,
+      })))
+      const workflow = choice === undefined ? undefined : workflows[Number(choice.value)]
+      if (workflow !== undefined) {
+        this.ui.appendNotice([
+          `${workflow.name} · ${workflow.id}`,
+          `- Status: ${workflow.stopReason ?? 'active/incomplete'}`,
+          `- Started: ${new Date(workflow.startedAt).toLocaleString()}`,
+          ...(workflow.endedAt === undefined ? [] : [`- Duration: ${formatDuration(workflow.endedAt - workflow.startedAt)}`]),
+          ...(workflow.members.length === 0
+            ? ['- Agents: none recorded']
+            : ['', 'Agents', ...workflow.members.map(member => `- ${member.phase === undefined ? '' : `${member.phase} · `}${member.label} · ${member.outcome} · ${member.childId}`)]),
+          '',
+          'This view comes from top-level durable tool-workflow records. A missing end can mean active work, a crash, or incomplete recording; live phase/log text and result values are not persisted by Harness rc.6.',
+        ].join('\n'))
+      }
+      return
+    }
+
+    const abort = new AbortController()
+    this.activityLoadAbort?.abort(new Error('activity loading superseded'))
+    this.activityLoadAbort = abort
+    const agent = this.agent
+    const generation = this.sessionGeneration
+    this.ui.setStatus('loading subagent tree…')
+    try {
+      const descendants = await this.ctx.subagents.listDescendants(agent.id, abort.signal)
+      if (generation !== this.sessionGeneration || this.handle?.agent !== agent) return
+      if (descendants.length === 0) {
+        this.ui.appendNotice('No durable subagent descendants were found for this session.')
+        return
+      }
+      const choice = await this.ui.chooseSearchable('Subagent descendants', descendants.map((entry, index) => ({
+        value: String(index),
+        label: `${'  '.repeat(Math.max(0, entry.depth - 1))}${entry.kind === 'child' ? entry.label ?? String(entry.id) : String(entry.id)}`,
+        description: entry.kind === 'child'
+          ? `${entry.mode} · ${entry.activity}${entry.hasChildren ? ' · has children' : ''}`
+          : `diagnostic · ${entry.reason}`,
+        searchText: entry.kind === 'child'
+          ? `${entry.id} ${entry.label ?? ''} ${entry.mode} ${entry.activity}`
+          : `${entry.id} ${entry.reason}`,
+      })))
+      const entry = choice === undefined ? undefined : descendants[Number(choice.value)]
+      if (entry !== undefined) {
+        this.ui.appendNotice(entry.kind === 'child'
+          ? [
+              `${entry.label ?? entry.id}`,
+              `- Session: ${entry.id}`,
+              `- Parent: ${entry.parentId}`,
+              `- Depth: ${String(entry.depth)}`,
+              `- Mode: ${entry.mode}`,
+              `- Activity: ${entry.activity}`,
+              `- Has children: ${entry.hasChildren ? 'yes' : 'no'}`,
+              '',
+              'Activity means resident or persisted; it is not a durable success/failure outcome.',
+            ].join('\n')
+          : `Subagent diagnostic\n- Session: ${entry.id}\n- Parent: ${entry.parentId}\n- Depth: ${String(entry.depth)}\n- Reason: ${entry.reason}`)
+      }
+    } finally {
+      if (this.activityLoadAbort === abort) this.activityLoadAbort = undefined
+    }
+  }
+
+  private async exportSession(argument: string): Promise<void> {
+    let format = argument.trim() as SessionExportFormat | ''
+    if (format !== '' && format !== 'json' && format !== 'markdown') {
+      throw new Error('usage: /export [markdown|json]')
+    }
+    if (format === '') {
+      const selected = await this.ui.choose('Export format', [
+        { value: 'markdown', label: 'Markdown', description: 'Readable transcript plus a lossless event-log appendix' },
+        { value: 'json', label: 'JSON', description: 'Versioned portable data envelope' },
+      ], undefined, { initialValue: 'markdown' })
+      if (selected === undefined) return
+      format = selected.value as SessionExportFormat
+    }
+
+    const cwd = this.agent.session.header.cwd ?? resolve(this.startup.cwd ?? process.cwd())
+    const defaultPath = join(cwd, defaultSessionExportFilename(this.agent.session.header, format))
+    const destinationChoice = await this.ui.choose(`Export current session\n\n${SESSION_EXPORT_DISCLOSURE}`, [
+      { value: 'default', label: 'Save in workspace', description: defaultPath },
+      { value: 'custom', label: 'Choose another path…', description: 'Enter an absolute or working-directory-relative path' },
+      { value: 'cancel', label: 'Cancel' },
+    ], undefined, { initialValue: 'default' })
+    if (destinationChoice === undefined || destinationChoice.value === 'cancel') return
+    let destination = defaultPath
+    if (destinationChoice.value === 'custom') {
+      const customPath = await this.ui.promptText('Export destination path:')
+      if (customPath === undefined || customPath.trim() === '') return
+      destination = resolve(cwd, customPath.trim())
+    }
+    const session = this.agent.session
+    await this.ctx.sessions.flush(session)
+    const official = this.ctx.sessionProjections.snapshot(session)
+    const events = session.events.filter(event => event.seq <= official.asOfSeq)
+    const sessionId = String(this.agent.id)
+    const presenter: ToolPresenter = {
+      presentCall: (name, argumentsValue) => this.ctx.tools.get(name, this.agent)?.presentCall?.(argumentsValue),
+      presentResult: (name, argumentsValue, result) => this.ctx.tools.get(name, this.agent)?.presentResult?.(
+        argumentsValue,
+        result as ToolResult,
+      ),
+    }
+    const input = {
+      header: session.header,
+      events,
+      projections: {
+        transcript: projectSession(sessionId, events, presenter),
+        visibility: projectVisibility(events, sessionId),
+        official,
+      },
+    }
+    try {
+      const written = await writeSessionExport(input, destination, { format })
+      this.ui.appendNotice(`Exported ${format} session to ${written.path} (${formatTokenCount(written.bytes)} bytes).\n${SESSION_EXPORT_DISCLOSURE}`)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      const overwrite = await this.ui.choose(`Replace existing export?\n\n${destination}`, [
+        { value: 'cancel', label: 'Cancel', description: 'Keep the existing file' },
+        { value: 'overwrite', label: 'Replace file', description: 'Atomically overwrite this exact path' },
+      ], undefined, { initialValue: 'cancel' })
+      if (overwrite?.value !== 'overwrite') return
+      const written = await writeSessionExport(input, destination, { format, overwrite: true })
+      this.ui.appendNotice(`Exported ${format} session to ${written.path} (${formatTokenCount(written.bytes)} bytes).\n${SESSION_EXPORT_DISCLOSURE}`)
+    }
+  }
+
   interrupt(): void {
     if (this.handle === undefined) return
     const sessionLoad = this.sessionLoadAbort
     if (sessionLoad !== undefined) sessionLoad.abort(new Error('session loading cancelled'))
+    const activityLoad = this.activityLoadAbort
+    if (activityLoad !== undefined) activityLoad.abort(new Error('activity loading cancelled'))
     if (this.agent.status === 'running') {
       this.agent.cancel({ kind: 'user' }, { keepInbox: true })
       this.ui.setStatus('stopping current turn…')
@@ -669,6 +1307,7 @@ export class DshTuiRunner {
 
     // A message may have been queued while the confirmation was open.
     if (this.blockSessionChangeForPending()) return
+    if (!await this.confirmDiscardPendingImages()) return
     await this.switchSession(resumeId)
   }
 
@@ -676,6 +1315,7 @@ export class DshTuiRunner {
     this.ui.setStatus(resumeId ? `opening ${resumeId}…` : 'creating a new session…')
     const previousId = String(this.agent.id)
     const previousSelection = this.selection?.current
+    await this.persistCurrentDraft()
     await this.detachCurrent()
     try {
       await this.open(resumeId)
@@ -685,8 +1325,97 @@ export class DshTuiRunner {
         this.ui.appendNotice(`Session change failed; restored ${previousId}`)
       } catch {
         await this.open(undefined, previousSelection)
+        this.pendingImages = []
         this.ui.appendNotice('Session change failed; opened a fresh session because the previous session could not be restored.')
       }
+      await this.restoreCurrentDraft()
+      this.refresh()
+      throw error
+    }
+    this.pendingImages = []
+    this.ui.appendLaunchBanner(
+      String(this.agent.id),
+      this.agent.session.header.cwd ?? resolve(this.startup.cwd ?? process.cwd()),
+    )
+    await this.restoreCurrentDraft()
+    this.ui.appendNotice(resumeId ? `Resumed ${resumeId}` : `New session ${this.agent.id}`)
+    this.refresh()
+  }
+
+  private async chooseSessionAction(): Promise<void> {
+    const action = await this.ui.choose('Current session actions', [
+      { value: 'rename', label: 'Rename…', description: 'Set a durable title for this session' },
+      { value: 'fork', label: 'Fork…', description: 'Create a new session from a completed turn' },
+      { value: 'archive', label: 'Archive…', description: 'Hide this session from normal navigation' },
+      { value: 'cancel', label: 'Cancel' },
+    ], undefined, { initialValue: 'cancel' })
+    if (action === undefined || action.value === 'cancel') return
+    if (action.value === 'rename') {
+      const current = this.ctx.sessionTitle.get(this.agent.session)?.title
+      const title = await this.ui.promptText(`New session title${current === undefined ? '' : ` (currently: ${current})`}:`)
+      if (title === undefined) return
+      const renamed = this.ctx.sessionTitle.rename(this.agent.session, title)
+      await this.ctx.sessions.flush(this.agent.session)
+      this.sessionNavigatorCache.delete(String(this.agent.id))
+      this.ui.appendNotice(`Renamed this session to ${renamed.title}.`)
+      return
+    }
+    if (action.value === 'fork') {
+      await this.chooseForkBoundary()
+      return
+    }
+    await this.archiveCurrentSession()
+  }
+
+  private async chooseForkBoundary(): Promise<void> {
+    if (this.blockSessionChangeForPending()) return
+    if (this.agent.status === 'running') {
+      this.ui.flashStatus('Stop the active turn before creating a fork.')
+      return
+    }
+    if (!await this.confirmDiscardPendingImages()) return
+    const endings = this.agent.session.events.filter(event => event.type === 'turn/end')
+    const choices = endings.length === 0
+      ? [{ value: '-1', label: 'Empty fork', description: 'Start with no prior turns' }]
+      : endings.map(event => ({
+          value: String(event.seq),
+          label: `After turn ${event.data.turn}`,
+          description: `${event.data.reason} · ${new Date(event.time).toLocaleString()} · seq ${event.seq}`,
+        })).reverse()
+    const choice = await this.ui.choose('Fork boundary', choices, undefined, { initialValue: choices[0]?.value })
+    if (choice === undefined) return
+    await this.forkCurrentSession(Number(choice.value))
+  }
+
+  private async forkCurrentSession(boundary: number): Promise<void> {
+    const source = this.agent.session
+    const previousId = String(source.id)
+    const previousSelection = this.selection?.current
+    if (previousSelection === undefined) throw new Error('model selection is unavailable')
+    const seed = boundary < 0 ? [] : source.events.filter(event => event.seq <= boundary)
+    const childId = SessionId(`session-${randomUUID()}`)
+    const selection: ModelSelectionRef = { current: previousSelection, assembled: undefined }
+    await this.persistCurrentDraft()
+    await this.detachCurrent()
+    try {
+      const contextWindow = await this.resolveContextWindow(previousSelection)
+      const handle = await this.ctx.agents.create({
+        sessionId: childId,
+        meta: {
+          ...(source.header.cwd === undefined ? {} : { cwd: source.header.cwd }),
+          parentSession: source.id,
+          seedLength: seed.length,
+        },
+        seed,
+        agentOptions: { provider: previousSelection.provider, model: previousSelection.model },
+        setup: (agentCtx: Context): void => { installModelSelection(agentCtx, selection) },
+      })
+      this.activateSession({ handle, selection, contextWindow })
+      await this.attachCurrentWorkspace()
+      this.pendingImages = []
+    } catch (error) {
+      await this.open(previousId, previousSelection)
+      await this.restoreCurrentDraft()
       this.refresh()
       throw error
     }
@@ -694,8 +1423,77 @@ export class DshTuiRunner {
       String(this.agent.id),
       this.agent.session.header.cwd ?? resolve(this.startup.cwd ?? process.cwd()),
     )
-    this.ui.appendNotice(resumeId ? `Resumed ${resumeId}` : `New session ${this.agent.id}`)
+    await this.restoreCurrentDraft()
+    this.ui.appendNotice(`Forked ${previousId} into ${this.agent.id} at ${boundary < 0 ? 'an empty history' : `seq ${boundary}`}.`)
     this.refresh()
+  }
+
+  private async archiveCurrentSession(): Promise<void> {
+    const archivedId = String(this.agent.id)
+    const confirmation = await this.ui.choose(
+      `Archive ${archivedId}?\n\nThe session log will be preserved, but Harness rc.6 cannot unarchive it.`,
+      [
+        { value: 'cancel', label: 'Cancel', description: 'Keep the session in normal navigation' },
+        { value: 'archive', label: 'Archive session', description: 'Hide it from normal session and workspace lists' },
+      ],
+      undefined,
+      { initialValue: 'cancel' },
+    )
+    if (confirmation?.value !== 'archive') return
+    await this.requestSessionSwitch()
+    if (String(this.agent.id) === archivedId) return
+    await this.ctx.workspaceRegistry.archiveSession(SessionId(archivedId))
+    this.sessionNavigatorCache.delete(archivedId)
+    this.ui.appendNotice(`Archived ${archivedId}. Its durable session log was preserved.`)
+  }
+
+  private async chooseWorkspace(): Promise<void> {
+    const workspaceRegistry = (this.ctx as Context & { get?: Context['get'] }).get?.('workspaceRegistry')
+    const archived = new Set(workspaceRegistry?.archivedSessionIds.map(String) ?? [])
+    const workspaces = this.ctx.workspaceRegistry.list()
+    const snapshots = await this.ctx.sessionPersistence.listSnapshots()
+    const visibleIds = snapshots
+      .filter(snapshot => snapshot.header.origin !== 'subagent' && !archived.has(String(snapshot.header.id)))
+      .map(snapshot => String(snapshot.header.id))
+    const visibleIdSet = new Set(visibleIds)
+    const groupedIds = new Set(workspaces.flatMap(workspace => workspace.sessionIds.map(String)))
+    const workspaceGroups = workspaces.map(workspace => {
+      const ids = workspace.sessionIds.map(String).filter(id => visibleIdSet.has(id))
+      return {
+        value: String(workspace.id),
+        label: workspace.title,
+        description: `${ids.length} sessions · ${workspace.path}`,
+        ids: new Set(ids),
+      }
+    })
+    const groups = [
+      ...workspaceGroups,
+      {
+        value: 'ungrouped',
+        label: 'Ungrouped sessions',
+        description: `${visibleIds.filter(id => !groupedIds.has(id)).length} sessions`,
+        ids: new Set(visibleIds.filter(id => !groupedIds.has(id))),
+      },
+    ].filter(group => group.ids.size > 0)
+    if (groups.length === 0) {
+      this.ui.appendNotice('No workspace-grouped sessions are available.')
+      return
+    }
+    const group = await this.ui.chooseSearchable('Workspaces', groups.map(item => ({
+      value: item.value,
+      label: item.label,
+      description: item.description,
+      searchText: `${item.label} ${item.description}`,
+    })))
+    if (group === undefined) return
+    const selected = groups.find(item => item.value === group.value)
+    if (selected === undefined) return
+    const items = (await this.loadSessionPickerItems()).filter(item => selected.ids.has(item.value))
+    const session = await this.ui.chooseSearchable(selected.label, items, undefined, {
+      initialValue: String(this.agent.id),
+      emptyText: 'No matching sessions',
+    })
+    if (session !== undefined && session.value !== String(this.agent.id)) await this.requestSessionSwitch(session.value)
   }
 
   private async detachCurrent(): Promise<void> {
@@ -716,13 +1514,13 @@ export class DshTuiRunner {
     this.selectedContextWindow = undefined
   }
 
-  private async chooseSession(): Promise<void> {
-    this.ui.setStatus('loading sessions…')
+  private async chooseSession(archived = false): Promise<void> {
+    this.ui.setStatus(archived ? 'loading archived sessions…' : 'loading sessions…')
     const abort = new AbortController()
     this.sessionLoadAbort = abort
     let items: PickerItem[]
     try {
-      items = await this.loadSessionPickerItems(abort.signal)
+      items = await this.loadSessionPickerItems(abort.signal, archived)
     } catch (error) {
       if (abort.signal.aborted) {
         this.ui.setStatus('session loading cancelled')
@@ -732,9 +1530,14 @@ export class DshTuiRunner {
     } finally {
       if (this.sessionLoadAbort === abort) this.sessionLoadAbort = undefined
     }
+    if (items.length === 0) {
+      this.ui.appendNotice(archived ? 'No archived sessions.' : 'No sessions are available.')
+      this.ui.setStatus('ready')
+      return
+    }
     const currentId = String(this.agent.id)
-    const choice = await this.ui.chooseSearchable('Sessions', items, undefined, {
-      initialValue: currentId,
+    const choice = await this.ui.chooseSearchable(archived ? 'Archived sessions' : 'Sessions', items, undefined, {
+      initialValue: items.some(item => item.value === currentId) ? currentId : undefined,
       emptyText: 'No matching sessions',
     })
     if (choice === undefined || choice.value === currentId) {
@@ -744,10 +1547,13 @@ export class DshTuiRunner {
     await this.requestSessionSwitch(choice.value)
   }
 
-  private async loadSessionPickerItems(signal?: AbortSignal): Promise<PickerItem[]> {
+  private async loadSessionPickerItems(signal?: AbortSignal, archivedOnly = false): Promise<PickerItem[]> {
     const snapshots = await this.ctx.sessionPersistence.listSnapshots(signal)
     signal?.throwIfAborted()
-    const visible = snapshots.filter(snapshot => snapshot.header.origin !== 'subagent')
+    const workspaceRegistry = (this.ctx as Context & { get?: Context['get'] }).get?.('workspaceRegistry')
+    const archived = new Set(workspaceRegistry?.archivedSessionIds.map(String) ?? [])
+    const visible = snapshots.filter(snapshot => snapshot.header.origin !== 'subagent'
+      && archived.has(String(snapshot.header.id)) === archivedOnly)
     const visibleIds = new Set(visible.map(snapshot => String(snapshot.header.id)))
     for (const id of this.sessionNavigatorCache.keys()) {
       if (!visibleIds.has(id)) this.sessionNavigatorCache.delete(id)
@@ -759,7 +1565,9 @@ export class DshTuiRunner {
       8,
       snapshot => this.loadSessionPickerSource(snapshot, currentId, signal),
     )
-    if (!visibleIds.has(currentId) && this.agent.session.header.origin !== 'subagent') {
+    if (!visibleIds.has(currentId)
+      && this.agent.session.header.origin !== 'subagent'
+      && archived.has(currentId) === archivedOnly) {
       sources.push(this.liveSessionPickerSource())
     }
     return sessionPickerItems(sources)
@@ -1006,6 +1814,70 @@ export class DshTuiRunner {
     ].join('\n')
   }
 
+  private async showProviders(): Promise<void> {
+    const active = this.ctx.llm.listProviders()
+    const configurable = new Map(this.ctx.llm.listConfigurableProviders().map(provider => [provider.provider, provider]))
+    const rows = await Promise.all(active.map(async provider => {
+      try {
+        const models = await this.ctx.llm.listModels(provider.id)
+        const modelSummary = models.length === 0
+          ? 'no catalog models'
+          : models.map(model => `${model.id} [${model.inputModalities?.join('+') ?? 'capabilities unknown'}]`).join(', ')
+        const config = configurable.get(provider.id)
+        return `- ${provider.id} (${provider.name}) · active${config === undefined ? '' : ` · settings ${config.settingsNs}`}\n  ${modelSummary}`
+      } catch (error) {
+        return `- ${provider.id} (${provider.name}) · model listing failed: ${String(error)}`
+      }
+    }))
+    const activeIds = new Set(active.map(provider => provider.id))
+    const dormant = [...configurable.values()]
+      .filter(provider => !activeIds.has(provider.provider))
+      .map(provider => `- ${provider.provider} (${provider.displayName}) · dormant · settings ${provider.settingsNs}`)
+    this.ui.appendNotice([
+      'Provider routes',
+      ...(rows.length === 0 ? ['- No active provider adapters.'] : rows),
+      ...(dormant.length === 0 ? [] : ['', 'Configurable but inactive', ...dormant]),
+      '',
+      'Credentials are intentionally not displayed. Use `deepseek auth status` to inspect the active credential source.',
+      'Provider profile changes remain a settings.yaml / advanced-settings workflow.',
+    ].join('\n'))
+  }
+
+  private showRuntime(): void {
+    const service = this.ctx.get('pluginInventory') as unknown as { list(): PluginInventorySnapshot } | undefined
+    const entries = service?.list().entries ?? []
+    const dshHome = resolveDshHome()
+    this.ui.appendNotice([
+      'Harness Host runtime',
+      ...(entries.length === 0
+        ? ['- Plugin inventory is unavailable.']
+        : entries.map(entry => `- ${entry.entryId} · ${entry.moduleName} · ${entry.enabled ? entry.fiberPhase ?? 'enabled' : 'disabled'}`)),
+      '',
+      'Configuration files',
+      `- User settings: ${join(dshHome, 'settings.yaml')}`,
+      `- TUI profile: ${join(dshHome, 'profiles', 'tui')}`,
+      `- User agent presets: ${join(dshHome, '.agent-presets')}`,
+      '',
+      'Plugin enablement and preset composition are configuration-file workflows; this panel is read-only.',
+    ].join('\n'))
+  }
+
+  private async showSupport(): Promise<void> {
+    const action = await this.ui.choose(
+      'Support and feedback\n\nThe official /feedback command records your note in this session. Its acknowledgement will disclose whether session sharing is enabled, feedback-gated, disabled, or not configured.',
+      [
+        { value: 'cancel', label: 'Cancel', description: 'Do not record feedback' },
+        { value: 'feedback', label: 'Write feedback…', description: 'Record a note through the official Harness command' },
+      ],
+      undefined,
+      { initialValue: 'cancel' },
+    )
+    if (action?.value !== 'feedback') return
+    const text = await this.ui.promptText('Feedback about this session:')
+    if (text === undefined || text.trim() === '') return
+    await this.runHarnessCommand(`/feedback ${text.trim()}`)
+  }
+
   private loadSettingsNamespacePickerItems(): PickerItem[] {
     return settingsNamespacePickerItems(this.ctx.settings.describe({ redactSecrets: true }).map(descriptor => ({
       ns: String(descriptor.ns),
@@ -1080,6 +1952,9 @@ export class DshTuiRunner {
       'transcript-density': this.transcriptDensity,
       'save-model-default': `${defaults.provider}/${defaults.model}`,
       'save-permission-default': this.ctx.permissionPresets.defaultPreset,
+      providers: `${this.ctx.llm.listProviders().length} active`,
+      runtime: 'read only',
+      support: '/feedback',
       advanced: `${this.ctx.settings.describe({ redactSecrets: true }).length} namespaces`,
     }
     return SETTINGS_PICKER_ITEMS.map(item => ({
@@ -1112,6 +1987,9 @@ export class DshTuiRunner {
       case 'permission': await this.choosePermission(); return
       case 'busy': await this.selectBusyEnter(''); return
       case 'transcript-density': await this.selectTranscriptDensity(); return
+      case 'providers': await this.showProviders(); return
+      case 'runtime': this.showRuntime(); return
+      case 'support': await this.showSupport(); return
       case 'advanced': await this.editAdvancedSettings(); return
       case 'save-model-default': {
         const current = this.selection?.current
@@ -1168,7 +2046,10 @@ export class DshTuiRunner {
     if (this.closing) return
     this.closing = true
     this.sessionLoadAbort?.abort(new Error('TUI shutting down'))
+    this.activityLoadAbort?.abort(new Error('TUI shutting down'))
     try {
+      await this.persistCurrentDraft()
+      await this.draftStore.flush()
       if (stopUi && this.started) this.ui.stop()
       await this.detachCurrent()
     } finally {

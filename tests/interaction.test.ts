@@ -108,6 +108,10 @@ test('builds reasoning and busy-behavior picker choices', () => {
   assert.deepEqual(BUSY_PICKER_ITEMS.map(item => item.value), ['queue', 'steer'])
   assert.ok(SETTINGS_PICKER_ITEMS.some(item => item.value === 'advanced'))
   assert.deepEqual(
+    SETTINGS_PICKER_ITEMS.filter(item => ['providers', 'runtime', 'support'].includes(item.value)).map(item => item.value),
+    ['providers', 'runtime', 'support'],
+  )
+  assert.deepEqual(
     SETTINGS_PICKER_ITEMS.find(item => item.value === 'transcript-density'),
     { value: 'transcript-density', label: 'Transcript detail', description: 'Choose how much transcript detail to show' },
   )

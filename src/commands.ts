@@ -5,6 +5,8 @@ export type LocalCommandName =
   | 'new'
   | 'resume'
   | 'sessions'
+  | 'session'
+  | 'workspaces'
   | 'pause'
   | 'stop'
   | 'model'
@@ -15,6 +17,12 @@ export type LocalCommandName =
   | 'settings'
   | 'queue'
   | 'steer'
+  | 'attach'
+  | 'deliverables'
+  | 'inspect'
+  | 'stats'
+  | 'activity'
+  | 'export'
   | 'exit'
 
 export type ParsedInput =
@@ -23,8 +31,9 @@ export type ParsedInput =
   | { kind: 'local'; name: LocalCommandName; argument: string }
 
 const LOCAL_COMMANDS = new Set<LocalCommandName>([
-  'help', 'new', 'resume', 'sessions', 'pause', 'stop', 'model', 'models',
+  'help', 'new', 'resume', 'sessions', 'session', 'workspaces', 'pause', 'stop', 'model', 'models',
   'reasoning', 'permission', 'busy', 'settings', 'queue', 'steer', 'exit',
+  'attach', 'deliverables', 'inspect', 'stats', 'activity', 'export',
 ])
 
 export interface HarnessCommandDescriptor {
@@ -40,14 +49,22 @@ export const LOCAL_SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: 'models', description: 'List available models' },
   { name: 'reasoning', description: 'Select reasoning effort for the current model', argumentHint: '[default|effort]' },
   { name: 'new', description: 'Start a fresh session' },
+  { name: 'session', description: 'Rename, fork, or archive a session', argumentHint: '[session-id]' },
+  { name: 'workspaces', description: 'Browse sessions grouped by workspace' },
   { name: 'pause', description: 'Stop, persist, and exit with a resume ID' },
   { name: 'permission', description: 'Set the tool permission mode', argumentHint: '<mode>' },
   { name: 'busy', description: 'Choose what plain Enter does while the agent is busy', argumentHint: '[queue|steer]' },
   { name: 'settings', description: 'Open the core TUI settings menu' },
-  { name: 'queue', description: 'Queue a separate follow-up turn', argumentHint: '<prompt>' },
+  { name: 'queue', description: 'Manage queued work or add a follow-up', argumentHint: '[prompt]' },
   { name: 'resume', description: 'Search sessions or open one by ID', argumentHint: '[session-id]' },
   { name: 'sessions', description: 'Search and switch sessions' },
   { name: 'steer', description: 'Steer the nearest active agent step', argumentHint: '<prompt>' },
+  { name: 'attach', description: 'Attach an image to the next prompt', argumentHint: '[path]' },
+  { name: 'deliverables', description: 'Browse files produced by successful tools' },
+  { name: 'inspect', description: 'Inspect steps and tool calls' },
+  { name: 'stats', description: 'Show timing and token statistics' },
+  { name: 'activity', description: 'Show jobs, workflows, and subagents' },
+  { name: 'export', description: 'Export the current session', argumentHint: '[markdown|json]' },
   { name: 'stop', description: 'Stop the active turn' },
 ]
 
@@ -92,6 +109,8 @@ export function parseInput(input: string): ParsedInput {
 export const HELP_TEXT = `Local TUI commands:
   /new                       start a fresh session
   /sessions                  search and switch sessions
+  /session [session-id]      rename, fork, or archive a session
+  /workspaces                browse sessions grouped by workspace
   /resume [session-id]       search sessions or open one by ID
   /models                    list available models
   /model <provider>/<model>  switch the next model request
@@ -102,7 +121,13 @@ export const HELP_TEXT = `Local TUI commands:
   /stop                      stop the active turn
   /pause                     stop, flush, print the resume id, and exit
   /steer <text>              steer the nearest agent step
-  /queue <text>              queue a separate follow-up turn
+  /queue [text]              manage queued work or add a follow-up turn
+  /attach [path]             attach an image to the next prompt
+  /deliverables              browse files produced by successful tools
+  /inspect                   inspect steps and tool calls
+  /stats                     show timing and token statistics
+  /activity                  show jobs, workflows, and subagents
+  /export [markdown|json]    export the current session
   /exit                      flush and exit
 
 Official Harness commands such as /compact, /goal, and /feedback are passed to ctx.commands.`

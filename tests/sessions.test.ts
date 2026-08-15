@@ -270,10 +270,12 @@ test('restores the previous session when opening a replacement fails', async () 
     detachCurrent(): Promise<void>
     open(id?: string): Promise<void>
     refresh(): void
+    pendingImages: unknown[]
     switchSession(): Promise<void>
   }
   subject.handle = { agent: { id: 'previous' } }
   subject.selection = { current: { provider: 'deepseek', model: 'v4' } }
+  subject.pendingImages = [{ name: 'unsent.png' }]
   subject.detachCurrent = async () => { order.push('detach') }
   subject.open = async id => {
     order.push(`open:${id ?? 'new'}`)
@@ -284,6 +286,7 @@ test('restores the previous session when opening a replacement fails', async () 
   await assert.rejects(subject.switchSession(), /replacement failed/)
   assert.deepEqual(order, ['detach', 'open:new', 'open:previous', 'refresh'])
   assert.deepEqual(notices, ['Session change failed; restored previous'])
+  assert.equal(subject.pendingImages.length, 1, 'a failed switch must retain unsent images on the restored session')
 })
 
 test('does not publish the target when saving or closing the current session fails', async () => {
@@ -321,10 +324,12 @@ test('opens a fresh fallback when a failed switch cannot restore an unpersisted 
     detachCurrent(): Promise<void>
     open(id?: string): Promise<void>
     refresh(): void
+    pendingImages: unknown[]
     switchSession(): Promise<void>
   }
   subject.handle = { agent: { id: 'blank-previous' } }
   subject.selection = { current: { provider: 'deepseek', model: 'v4' } }
+  subject.pendingImages = [{ name: 'unsent.png' }]
   subject.detachCurrent = async () => { order.push('detach') }
   let newAttempts = 0
   subject.open = async id => {
@@ -339,4 +344,5 @@ test('opens a fresh fallback when a failed switch cannot restore an unpersisted 
   assert.deepEqual(notices, [
     'Session change failed; opened a fresh session because the previous session could not be restored.',
   ])
+  assert.equal(subject.pendingImages.length, 0, 'a fresh fallback must not inherit another session’s unsent images')
 })

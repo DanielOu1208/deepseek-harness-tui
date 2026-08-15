@@ -50,6 +50,8 @@ export interface SettingsChoice {
 }
 export interface TuiCallbacks {
     onPrompt(text: string): void | Promise<void>;
+    onDraftChange?(text: string): void | Promise<void>;
+    onPasteImage?(): void | Promise<void>;
     onSettings(): void | Promise<void>;
     onTogglePlanMode?(): void | Promise<void>;
     onReasoningStep?(direction: 'increase' | 'decrease'): void | Promise<void>;
@@ -77,6 +79,9 @@ export declare class DeepSeekTui {
     private started;
     constructor(terminal?: Terminal);
     setSlashCommands(commands: readonly SlashCommand[], cwd: string): void;
+    getComposerText(): string;
+    setComposerText(text: string): void;
+    copyToClipboard(text: string): void;
     setTranscriptDensity(density: TranscriptDensity): void;
     start(callbacks: TuiCallbacks): void;
     stop(): void;

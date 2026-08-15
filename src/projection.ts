@@ -201,13 +201,27 @@ function contextPresentation(source: unknown): ContextPresentation {
 
 function textFromBlocks(content: unknown): string {
   if (!Array.isArray(content)) return ''
-  return content.flatMap((block: unknown) => {
-    if (typeof block !== 'object' || block === null) return []
+  let text = ''
+  let previousWasImage = false
+  for (const block of content) {
+    if (typeof block !== 'object' || block === null) continue
     const value = block as { type?: unknown; text?: unknown; content?: unknown }
-    if ((value.type === 'text' || value.type === 'reasoning') && typeof value.text === 'string') return [value.text]
-    if (value.type === 'tool-result') return [textFromBlocks(value.content)]
-    return []
-  }).join('')
+    if ((value.type === 'text' || value.type === 'reasoning') && typeof value.text === 'string') {
+      if (previousWasImage && value.text !== '' && !value.text.startsWith('\n')) text += '\n'
+      text += value.text
+      previousWasImage = false
+    } else if (value.type === 'image') {
+      if (text !== '' && !text.endsWith('\n')) text += '\n'
+      text += '[image]'
+      previousWasImage = true
+    } else if (value.type === 'tool-result') {
+      const nested = textFromBlocks(value.content)
+      if (previousWasImage && nested !== '' && !nested.startsWith('\n')) text += '\n'
+      text += nested
+      previousWasImage = false
+    }
+  }
+  return text
 }
 
 function parseToolArguments(value: unknown): unknown {
