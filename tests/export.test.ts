@@ -174,7 +174,7 @@ test('writes owner-private output atomically and refuses overwrite by default', 
   const result = await writeSessionExport(input, destination)
   assert.equal(result.path, resolve(destination))
   assert.equal(result.format, 'json')
-  assert.equal((await stat(destination)).mode & 0o777, 0o600)
+  if (process.platform !== 'win32') assert.equal((await stat(destination)).mode & 0o777, 0o600)
   const original = await readFile(destination, 'utf8')
 
   await assert.rejects(writeSessionExport({ ...input, projections: { changed: true } }, destination), /EEXIST/)

@@ -58,9 +58,11 @@ test('writes owner-private versioned JSON atomically', async () => {
     const file = join(storeRoot, entries[0] ?? '')
     const metadata = await lstat(file)
     assert.equal(metadata.isFile(), true)
-    assert.equal(metadata.mode & 0o777, 0o600)
     const rootMetadata = await lstat(storeRoot)
-    assert.equal(rootMetadata.mode & 0o777, 0o700)
+    if (process.platform !== 'win32') {
+      assert.equal(metadata.mode & 0o777, 0o600)
+      assert.equal(rootMetadata.mode & 0o777, 0o700)
+    }
     assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), {
       owner: '@chalk/dsh-tui',
       version: 1,
