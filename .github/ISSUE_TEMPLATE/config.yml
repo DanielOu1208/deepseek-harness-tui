@@ -1,0 +1,6 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability privately
+    url: https://github.com/DanielOu1208/deepseek-harness-tui/security/advisories/new
+    about: Do not disclose vulnerabilities or secrets in a public issue.
+
