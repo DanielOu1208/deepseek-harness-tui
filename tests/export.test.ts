@@ -143,6 +143,32 @@ test('preserves similarly named plugin data outside an exact image attachment sh
   })
 })
 
+test('omits encoded payloads from plugin-style image records', () => {
+  const input = fixture()
+  input.events[0] = {
+    seq: 0,
+    time: 1,
+    type: 'plugin/custom',
+    data: {
+      content: [{
+        type: 'image',
+        mimeType: 'image/png',
+        name: 'preview.png',
+        data: 'VERY_SECRET_BASE64',
+        previewUrl: 'data:image/png;base64,ALSO_SECRET',
+      }],
+    },
+  } as unknown as SessionEvent
+
+  const envelope = createSessionExport(input)
+  const image = (envelope.session.events[0] as { data: { content: Array<Record<string, unknown>> } }).data.content[0]!
+  assert.deepEqual(image, {
+    mimeType: 'image/png',
+    name: 'preview.png',
+    type: 'image',
+  })
+})
+
 test('renders deterministic Markdown from projections and events', () => {
   const input = fixture()
   const first = renderSessionExportMarkdown(input)

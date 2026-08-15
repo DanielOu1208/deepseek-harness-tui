@@ -87,11 +87,17 @@ function isImageAttachmentRef(value: unknown): boolean {
     && Number.isInteger(record.height) && Number(record.height) > 0
 }
 
+function hasImageMediaType(record: Record<string, unknown>): boolean {
+  const mediaType = record.mediaType ?? record.mimeType
+  return typeof mediaType === 'string' && mediaType.toLowerCase().startsWith('image/')
+}
+
 function isAttachmentObject(record: Record<string, unknown>): boolean {
   return isImageAttachmentRef(record)
     || (record.type === 'image' && isImageAttachmentRef(record.attachment))
     || isImageAttachmentRef(record.ref)
-    || (typeof record.mediaType === 'string' && record.mediaType.startsWith('image/') && isBinary(record.data))
+    || (record.type === 'image' && (hasImageMediaType(record) || 'data' in record || 'base64' in record))
+    || (hasImageMediaType(record) && ('data' in record || 'base64' in record))
 }
 
 function isByteField(key: string, value: unknown, attachmentContext: boolean): boolean {
@@ -99,6 +105,7 @@ function isByteField(key: string, value: unknown, attachmentContext: boolean): b
   const normalized = key.toLowerCase()
   if (!attachmentContext) return false
   if (BYTE_KEY.test(normalized)) return true
+  if (typeof value === 'string' && /^data:image\//iu.test(value)) return true
   if (normalized === 'data' && attachmentContext && (typeof value === 'string' || Array.isArray(value))) return true
   if (normalized === 'bytes' && attachmentContext && typeof value !== 'number') return true
   return false
