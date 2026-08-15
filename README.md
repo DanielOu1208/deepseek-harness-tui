@@ -79,6 +79,7 @@ Inside the TUI:
 - F2 opens the settings list.
 - Shift+Tab switches between plan and build mode. During an active turn, the Harness applies the switch at the next safe model step.
 - Shift+Up and Shift+Down raise or lower the reasoning effort for the next model request. The shortcut stops at the highest and lowest advertised levels.
+- Ctrl+V attaches a supported image from the system clipboard when the platform provides one; `/attach path` is the portable fallback.
 - Up/Down and Enter operate menus; Space toggles checkbox answers.
 - `/` opens Harness commands.
 - `@` opens file completion.
@@ -96,19 +97,35 @@ Common local commands:
 | `/new` | Start a fresh session |
 | `/sessions`, `/resume` | Search sessions by title, ID, or working directory |
 | `/resume <session-id>` | Open a known session directly |
+| `/session [session-id]` | Rename, fork, or one-way archive a session |
+| `/workspaces` | Browse non-archived sessions grouped by workspace |
 | `/model`, `/reasoning` | Change the next model request |
 | `/permission <mode>` | Set `read-only`, `workspace-write`, or `danger-full-access` tool access |
 | `/settings` or F2 | Open the Pi-style settings list |
 | `/busy` | Choose queue or steer behavior while an agent is running |
-| `/queue <prompt>` | Queue a separate follow-up turn |
+| `/queue [prompt]` | Manage queued work or queue a separate follow-up turn |
 | `/steer <prompt>` | Inject guidance at the next safe step of the active turn |
+| `/attach [path]` | Manage pending images or attach a PNG, JPEG, GIF, or WebP file |
+| `/deliverables` | Browse paths reported by successful mutation tools |
+| `/inspect` | Search model steps, tool calls, nested calls, timing, and errors |
+| `/stats` | Show whole-session timing and provider token/cache totals |
+| `/activity` | Inspect background jobs, workflows, and subagent descendants |
+| `/export [markdown\|json]` | Atomically export the current session without attachment bytes |
 | `/stop` | Stop the active turn and keep the TUI open |
 | `/pause` | Stop, flush, print the resume ID, and exit |
 | `/exit` | Flush and exit |
 
 The old singular `/setting` spelling remains accepted for compatibility, but is hidden from completion and help.
 
-The session navigator is sorted by recent activity and includes the current session, persisted non-subagent fork sessions, working directory, and short session ID. `/new` creates an unrelated session; creating a fork is not yet a TUI action. Subagent-owned sessions are hidden. Switching is blocked while queued messages are waiting, because disposing the active Harness agent would otherwise discard that queued work. If a turn is running without queued work, the TUI asks before stopping it.
+The session navigator is sorted by recent activity and includes the current session, persisted non-subagent fork sessions, working directory, and short session ID. `/new` creates an unrelated session; `/session` can create a fork at a completed-turn boundary. Subagent-owned sessions stay out of ordinary navigation and are visible under `/activity`. Switching is blocked while queued messages are waiting, because disposing the active Harness agent would otherwise discard that queued work. If a turn is running without queued work, the TUI asks before stopping it.
+
+Archiving is one-way in Harness `0.1.0-rc.6`: `/session` gives a strong warning and defaults to Cancel. Archived logs remain durable and can be found with `/sessions archived`, but the current runtime exposes no safe unarchive operation.
+
+Bare `/queue` can view pending work, replace text-only items in place, and remove an item that has not been claimed. The runtime does not expose queue reordering, so the TUI does not imitate it with private inbox state.
+
+Text drafts are saved per session under `$DSH_HOME/tui/drafts/v1` using owner-private files and restored during navigation. Pending images are intentionally not persisted. The TUI validates and stores images through the official attachment service, shows `[image]` in terminal history, and does not require terminal-specific inline graphics support.
+
+`/export` flushes the current session before writing an owner-private Markdown or versioned JSON file. Attachment references and metadata are preserved, but raw image bytes and encoded payloads are omitted. Exports can still contain sensitive prompts, tool output, and local paths.
 
 `danger-full-access` permits unrestricted tool access. Use it only when the current session and working directory are trusted.
 
@@ -121,6 +138,12 @@ The TUI keeps user prompts and assistant answers readable while reducing interna
 - **Debug** shows bounded reasoning, injected context, tool output, and routine runtime events.
 
 The selected mode is saved globally in the Harness `dsh-tui` settings namespace and applies live. It changes only terminal presentation: model context and durable session events remain unchanged. Debug output still has rendering safety limits; the persisted Harness session remains the authoritative source for larger raw content.
+
+### Runtime and provider settings
+
+F2 includes read-only provider capability and Host plugin summaries. Provider profiles remain in `$DSH_HOME/settings.yaml`; TUI profile composition remains under `$DSH_HOME/profiles/tui`; user agent presets remain under `$DSH_HOME/.agent-presets`. Registered settings namespaces can still be changed from F2 → Advanced runtime settings. Credentials are never displayed; use `deepseek auth status` to inspect their source.
+
+F2 → Support and feedback invokes the official `/feedback` command. Its acknowledgement states whether session sharing is enabled, feedback-gated, disabled, or not configured.
 
 ## Update
 

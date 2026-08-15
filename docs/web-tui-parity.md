@@ -25,26 +25,26 @@ The official Harness runtime remains the source of truth. New TUI features shoul
 | Area | TUI status | Current terminal path | Remaining parity target |
 |---|---|---|---|
 | Core conversation and streaming | Supported | Composer, streaming reasoning and answers, stop, retry/error presentation | Keep aligned with official session events. |
-| Tool calls, results, and diffs | Supported | Terminal-native cards, bounded output, syntax-aware diffs, approval dialogs | Add a drill-down inspector for full call/result metadata. |
+| Tool calls, results, and diffs | Supported | Terminal-native cards, bounded output, syntax-aware diffs, approval dialogs, `/inspect` drill-down | Keep presentation aligned with official tool metadata. |
 | Questions and approvals | Supported | Single- and multi-select dialogs, custom answers, required-interaction priority | Keep aligned with official request contracts. |
 | Plan, goal, permissions, model, reasoning | Supported | Slash commands, F2 settings, Shift+Tab, Shift+Up/Down | Surface richer provider/model capability details where useful. |
-| Context and token visibility | Partial | Footer shows context pressure, capacity, and request token counts | Add session totals, timing, cache use, and clearer per-turn breakdowns. |
+| Context and token visibility | Supported | Footer context pressure plus `/stats` session timing and four provider-reported token/cache buckets | Keep the distinction between context estimates and provider usage explicit. |
 | Session discovery and resume | Supported | `/sessions` or bare `/resume` opens title-aware fuzzy search across title, full ID, and working directory | Add session actions without turning the navigator into a browser clone. |
-| Session actions | Missing | Existing forks can be discovered and their lineage is shown, but the TUI cannot create a fork, rename, or archive | Add TUI-native create-fork, rename, and archive actions with confirmation. |
-| Workspace grouping | Missing | Working directory is display/search metadata only; sessions are not grouped | Add optional grouping/filtering by working directory. |
-| Queued work | Partial | `/queue`, `/steer`, Busy Enter mode, durable pending-work guard during session changes | Add a queue viewer with reorder/remove where runtime contracts allow it. |
-| Per-session composer drafts | Missing | One in-process draft survives dialogs, but it is neither persisted nor associated with a session | Persist one draft per session and restore it on navigation. |
-| Produced files and deliverables | Missing | Tool transcript may mention paths | Add a searchable file/deliverable panel with safe open/copy actions. |
-| Tool trajectory and inspection | Partial | Debug transcript exposes bounded details | Add a focused step/tool inspector with timing and error context. |
-| Jobs, workflows, and subagents | Partial | Official runtime events appear in the transcript; subagent sessions are hidden from ordinary resume | Add dedicated status and navigation views for active/background work. |
-| Image input and output | Missing | No first-class image flow | Use terminal-native file selection and supported inline-image protocols, with textual fallback. |
-| Providers and credentials | Partial | Launcher auth commands plus model selection | Add safe provider/credential status and management without displaying secrets. |
-| Presets, plugins, and runtime settings | Partial | Core and registered settings namespaces are browsable; official commands remain available | Add discoverable preset/plugin summaries and safe configuration paths. |
-| Export | Missing | Persisted session remains authoritative, but there is no export action | Add explicit Markdown and JSON export. |
-| Feedback | Partial | A profile-provided `/feedback` command may be available, but there is no dedicated discoverable flow | Add a clear terminal-native feedback flow while preserving the official command. |
-| Session statistics | Missing | Context and current-request usage only | Add totals and timing from official stats/projection contracts. |
+| Session actions | Supported | `/session` renames, creates a boundary-safe fork, or archives after strong confirmation | Harness rc.6 has no safe unarchive contract; archive is one-way. |
+| Workspace grouping | Supported | `/workspaces` groups non-archived sessions through the official workspace registry | Keep working-directory failures isolated from session opening. |
+| Queued work | Supported | Bare `/queue` views, edits text-only items, and safely removes unclaimed items | Reordering is deferred because rc.6 exposes no public reorder operation. |
+| Per-session composer drafts | Supported | Text drafts save privately under `$DSH_HOME/tui/drafts/v1` and restore across navigation | Images remain deliberately non-persistent. |
+| Produced files and deliverables | Supported | `/deliverables` derives successful mutation outputs and offers copy/open actions | Only tool-declared successful mutations are treated as deliverables. |
+| Tool trajectory and inspection | Supported | `/inspect` searches bounded step, root-tool, and nested Code Mode records with timing and error context | Raw detail remains bounded for terminal safety. |
+| Jobs, workflows, and subagents | Supported | `/activity` inspects process-local jobs, durable workflow records, and durable descendant sessions | Live workflow phase/log messages are not durable in rc.6; subagent activity is not an outcome. |
+| Image input and output | Partial | `/attach path` and Ctrl+V use official image attachments; transcript fallback is `[image]` | Inline terminal image rendering and model-produced image output are intentionally not emulated. |
+| Providers and credentials | Partial | F2 provider summaries, model modalities, launcher `auth status`, and secret-redacted advanced settings | Provider profiles remain a `settings.yaml` workflow; credentials are never shown. |
+| Presets, plugins, and runtime settings | Supported | F2 shows the read-only Host plugin inventory, configuration paths, and registered settings namespaces | Plugin enablement and deeper preset composition remain configuration-file workflows. |
+| Export | Supported | `/export` writes owner-private, atomic Markdown or versioned JSON without attachment bytes | Exports disclose that prompts, tool output, and paths may be sensitive. |
+| Feedback | Supported | F2 → Support and feedback invokes the official `/feedback` command and its sharing disclosure | Keep the official command as the recording authority. |
+| Session statistics | Supported | `/stats` uses official whole-log stats and provider-reported usage buckets | Nested Code Mode time is labeled separately from official root-tool time. |
 | Browser layout, split panes, theme | Intentionally different | Scrollable transcript, inline dialogs, compact status footer | Preserve terminal navigation and readable narrow-width behavior. |
-| Drag-and-drop and image lightbox | Intentionally different | File completion and text paths | Use file pickers, terminal image protocols, and external-open actions. |
+| Drag-and-drop and image lightbox | Intentionally different | `/attach`, clipboard input, `[image]` transcript fallback, and external-open actions | Preserve portable terminal behavior rather than requiring graphics protocols. |
 
 The session navigator intentionally does not search full transcript text. It searches title, full session ID, and working directory so results remain fast and predictable without maintaining a second content index.
 
@@ -52,13 +52,27 @@ The session navigator intentionally does not search full transcript text. It sea
 
 Use these paths to reproduce the matrix rather than treating status labels as assertions:
 
-- Core conversation, tools, questions, approvals, and transcript behavior: [`tests/projection.test.ts`](../tests/projection.test.ts) and [`tests/ui.test.ts`](../tests/ui.test.ts).
+- Core conversation, tools, questions, approvals, drafts, and transcript behavior: [`tests/projection.test.ts`](../tests/projection.test.ts), [`tests/ui.test.ts`](../tests/ui.test.ts), and [`tests/drafts.test.ts`](../tests/drafts.test.ts).
 - Plan/reasoning shortcuts, context pressure, capacity, and request usage: [`tests/shortcuts.test.ts`](../tests/shortcuts.test.ts) and the footer cases in [`tests/ui.test.ts`](../tests/ui.test.ts).
 - Session discovery, caching, filtering, switching, and failure safety: [`tests/sessions.test.ts`](../tests/sessions.test.ts), session picker cases in [`tests/interaction.test.ts`](../tests/interaction.test.ts), and the terminal smoke below.
-- Models, permissions, queues, settings, goals, and commands: [`tests/interaction.test.ts`](../tests/interaction.test.ts), [`tests/commands.test.ts`](../tests/commands.test.ts), and the command paths documented in the [README](../README.md#run).
-- Partial and Missing rows are comparison findings: verify the current TUI paths above against the installed official `@deepseek-ai/dsh-web-app/cordis.patch.yml` roster and relevant installed `@deepseek-ai/dsh-client-ui-*/README.md` contracts. Record the exact package version and observed gap when changing a status.
+- Models, permissions, queues, settings, goals, commands, attachments, and deliverables: [`tests/interaction.test.ts`](../tests/interaction.test.ts), [`tests/commands.test.ts`](../tests/commands.test.ts), and [`tests/parity-foundation.test.ts`](../tests/parity-foundation.test.ts).
+- Tool timing, token buckets, workflows, and export: [`tests/visibility.test.ts`](../tests/visibility.test.ts), [`tests/activity.test.ts`](../tests/activity.test.ts), and [`tests/export.test.ts`](../tests/export.test.ts).
+- Partial and Deferred rows are comparison findings: verify the current TUI paths above against the installed official `@deepseek-ai/dsh-web-app/cordis.patch.yml` roster and relevant installed `@deepseek-ai/dsh-client-ui-*/README.md` contracts. Record the exact package version and observed gap when changing a status.
 
-The current matrix is based on automated tests plus an isolated terminal smoke. It is a contract/capability comparison, not browser pixel testing.
+The current matrix is based on 123 automated tests plus an isolated compiled-launcher and terminal startup/exit smoke on macOS. It is a contract/capability comparison, not browser pixel testing. Clipboard commands are covered with deterministic adapters; real clipboard acceptance still requires manual testing on each operating system.
+
+## Verification gates
+
+A parity change is ready to commit only when all of these hold:
+
+- `npm run check` passes the full suite and regenerates `lib/` without drift.
+- `npm run pack:check` passes, and compressed package growth stays within 250 KiB of the 49,804-byte pre-parity baseline unless a larger change is explicitly reviewed.
+- The profile dump contains only Host/runtime services added by this TUI—no `dsh-client-*`, React, Web API proxy, browser UI, or browser transport additions.
+- An isolated packed install passes `deepseek --help` and `deepseek --version` without creating state outside its temporary `$DSH_HOME`.
+- An isolated compiled TUI starts, renders an idle session, and exits with Ctrl+D without sending a model request.
+- CI repeats build, generated-output, launcher, and package checks on Ubuntu with Node 22.19 and 24, macOS with Node 24, and Windows with Node 24.
+
+Record evidence honestly: the suite is automated, the local startup/exit check is a terminal smoke, and real clipboard interoperability is manual/unavailable until exercised on the named platform.
 
 ## Roadmap
 
@@ -72,25 +86,35 @@ The current matrix is based on automated tests plus an isolated terminal smoke. 
 
 ### P1a — Daily workflow
 
-- [ ] Queue manager with view and safe removal/reordering where supported.
-- [ ] Session rename, fork, and archive actions.
-- [ ] Produced-files and deliverables panel.
-- [ ] Terminal-native image attachment and rendering with graceful fallback.
-- [ ] Per-session composer drafts.
+- [x] Queue manager with view, text editing, and safe removal. Reordering awaits an official contract.
+- [x] Session rename, boundary-safe fork, and one-way archive actions.
+- [x] Produced-files and deliverables panel.
+- [x] Portable clipboard and path-based image attachment with `[image]` fallback.
+- [x] Owner-private per-session text drafts.
 
 ### P1b — Visibility
 
-- [ ] Drill-down tool and trajectory inspector.
-- [ ] Per-turn and per-tool timing.
-- [ ] Jobs, workflows, and subagent status views.
-- [ ] Richer token, cache, and session-total statistics.
+- [x] Drill-down step, tool, and nested-tool inspector.
+- [x] Per-step, root-tool, and nested-tool timing.
+- [x] Jobs, workflows, and subagent status views with lifecycle disclosures.
+- [x] Provider token/cache buckets and whole-session timing statistics.
 
 ### P2 — Configuration and support
 
-- [ ] Provider and credential status/management.
-- [ ] Preset and plugin discovery/configuration.
-- [ ] Markdown and JSON export.
-- [ ] Explicit feedback flow.
+- [x] Safe provider capability summary and credential-source guidance.
+- [x] Read-only preset/plugin/runtime discovery and configuration paths.
+- [x] Owner-private Markdown and versioned JSON export.
+- [x] Explicit feedback flow through the official command.
+
+## Deferred runtime-contract gaps
+
+These are deliberately not emulated with private state or Web client code:
+
+- Queue reordering: rc.6 exposes replace and remove for unclaimed inbox items, but no public reorder operation.
+- Unarchive: the workspace registry exposes one-way archive only. The TUI warns and defaults to Cancel.
+- Per-session preset selection: the current Agent factory does not expose a safe published-session mutation path. Preset defaults and composition remain configuration-file workflows.
+- Live plugin mutation: the Host inventory is read-only. Enablement and ordering remain profile patch workflows.
+- Inline image rendering: clipboard and path input are portable, while transcript output stays `[image]`; terminal-specific graphics protocols are not required.
 
 ## How to refresh this document
 
