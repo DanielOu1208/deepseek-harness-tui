@@ -36,6 +36,12 @@ export interface ChooseOptions {
     initialValue?: string;
     priority?: 'optional' | 'required';
 }
+export interface SearchableSelectItem extends SelectItem {
+    searchText?: string;
+}
+export interface SearchableChooseOptions extends ChooseOptions {
+    emptyText?: string;
+}
 export interface SettingsChoice {
     id: string;
     label: string;
@@ -81,6 +87,7 @@ export declare class DeepSeekTui {
     flashStatus(note: string, durationMs?: number): void;
     flashError(error: unknown): void;
     choose(title: string, items: SelectItem[], signal?: AbortSignal, options?: ChooseOptions): Promise<SelectItem | undefined>;
+    chooseSearchable(title: string, items: SearchableSelectItem[], signal?: AbortSignal, options?: SearchableChooseOptions): Promise<SearchableSelectItem | undefined>;
     chooseMany(title: string, items: SelectItem[], signal?: AbortSignal, options?: ChooseOptions): Promise<SelectItem[] | undefined>;
     chooseSetting(title: string, items: SettingsChoice[], signal?: AbortSignal, initialId?: string): Promise<string | undefined>;
     promptText(title: string, signal?: AbortSignal, options?: ChooseOptions): Promise<string | undefined>;

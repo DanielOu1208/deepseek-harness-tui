@@ -17,7 +17,8 @@ import type {} from '@deepseek-ai/dsh-session-projection'
 import type {} from '@deepseek-ai/dsh-token-meter'
 import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { PERMISSION_SETTINGS_NAMESPACE } from '@deepseek-ai/dsh-permission-presets'
-import type {} from '@deepseek-ai/dsh-session-persistence'
+import type { SessionPersistenceSnapshot } from '@deepseek-ai/dsh-session-persistence'
+import { foldSessionTitle } from '@deepseek-ai/dsh-session-title'
 import type { SettingsScope } from '@deepseek-ai/dsh-settings'
 import type { ToolResult } from '@deepseek-ai/dsh-tools'
 import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
@@ -48,6 +49,7 @@ import {
   type ModelPickerSource,
   type PickerItem,
   type ReasoningStepDirection,
+  type SessionPickerSource,
 } from './interaction.js'
 import { createProjection, foldSessionEvent, type ProjectionState, type ToolPresenter } from './projection.js'
 import type { TuiStartupOptions } from './startup.js'
@@ -106,6 +108,34 @@ function questionTitle(question: AskUserQuestionItem): string {
   ].filter((part): part is string => Boolean(part)).join('\n\n')
 }
 
+async function mapWithConcurrency<T, Result>(
+  items: readonly T[],
+  limit: number,
+  visit: (item: T) => Promise<Result>,
+): Promise<Result[]> {
+  const results = new Array<Result>(items.length)
+  let nextIndex = 0
+  const worker = async (): Promise<void> => {
+    while (nextIndex < items.length) {
+      const index = nextIndex
+      nextIndex += 1
+      results[index] = await visit(items[index]!)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return results
+}
+
+function updatedAt(events: readonly SessionEvent[], createdAt: number): number {
+  return events.at(-1)?.time ?? createdAt
+}
+
+interface PreparedSession {
+  handle: AgentHandle
+  selection: ModelSelectionRef
+  contextWindow?: number
+}
+
 export class DshTuiRunner {
   private handle?: AgentHandle
   private selection?: ModelSelectionRef
@@ -119,7 +149,10 @@ export class DshTuiRunner {
   private localTranscriptDensity: TranscriptDensity = DEFAULT_TRANSCRIPT_DENSITY
   private selectedContextWindow?: number
   private shortcutQueue: Promise<void> = Promise.resolve()
+  private actionQueue: Promise<void> = Promise.resolve()
   private sessionGeneration = 0
+  private sessionLoadAbort?: AbortController
+  private readonly sessionNavigatorCache = new Map<string, { revision: string; source: SessionPickerSource }>()
 
   constructor(
     private readonly ctx: Context,
@@ -155,11 +188,11 @@ export class DshTuiRunner {
     )
     this.ui.start({
       onPrompt: text => this.submit(text),
-      onSettings: () => this.chooseSettings(),
-      onTogglePlanMode: () => this.enqueueShortcut(() => this.togglePlanMode()),
-      onReasoningStep: direction => this.enqueueShortcut(() => this.stepReasoning(direction)),
+      onSettings: () => this.enqueueAction(() => this.chooseSettings()),
+      onTogglePlanMode: () => this.enqueueAction(() => this.enqueueShortcut(() => this.togglePlanMode())),
+      onReasoningStep: direction => this.enqueueAction(() => this.enqueueShortcut(() => this.stepReasoning(direction))),
       onInterrupt: () => this.interrupt(),
-      onExit: () => this.shutdown(true),
+      onExit: () => this.enqueueAction(() => this.shutdown(true)),
     })
     this.started = true
     this.refresh()
@@ -246,15 +279,18 @@ export class DshTuiRunner {
     return { answers }
   }
 
-  private async open(resumeId?: string): Promise<void> {
-    const defaultSelection = this.ctx.agentDefaultModel.currentSelection()
+  private async prepareSession(
+    resumeId?: string,
+    fallbackSelection?: ModelSelection,
+  ): Promise<PreparedSession> {
+    const defaultSelection = fallbackSelection ?? this.ctx.agentDefaultModel.currentSelection()
     let selected = defaultSelection
     if (resumeId !== undefined) {
       const inspected = await this.ctx.sessionPersistence.inspect(SessionId(resumeId))
       selected = modelFromEvents(inspected.events, defaultSelection)
     }
     const selection: ModelSelectionRef = { current: selected, assembled: undefined }
-    this.selectedContextWindow = await this.resolveContextWindow(selected)
+    const contextWindow = await this.resolveContextWindow(selected)
     const setup = (agentCtx: Context): void => { installModelSelection(agentCtx, selection) }
     const handle = resumeId === undefined
       ? await this.ctx.agents.create({
@@ -268,9 +304,18 @@ export class DshTuiRunner {
           agentOptions: { provider: selected.provider, model: selected.model },
           setup,
         })
-    this.handle = handle
-    this.selection = selection
-    this.bindAgent(handle.agent)
+    return { handle, selection, contextWindow }
+  }
+
+  private activateSession(prepared: PreparedSession): void {
+    this.handle = prepared.handle
+    this.selection = prepared.selection
+    this.selectedContextWindow = prepared.contextWindow
+    this.bindAgent(prepared.handle.agent)
+  }
+
+  private async open(resumeId?: string, fallbackSelection?: ModelSelection): Promise<void> {
+    this.activateSession(await this.prepareSession(resumeId, fallbackSelection))
   }
 
   private bindAgent(agent: Agent): void {
@@ -403,6 +448,12 @@ export class DshTuiRunner {
     return queued
   }
 
+  private enqueueAction(action: () => Promise<void>): Promise<void> {
+    const queued = this.actionQueue.then(action, action)
+    this.actionQueue = queued.catch(() => {})
+    return queued
+  }
+
   private async togglePlanMode(): Promise<void> {
     const handle = this.handle
     if (handle === undefined) throw new Error('no active DeepSeek session')
@@ -462,7 +513,11 @@ export class DshTuiRunner {
     this.ui.setStatus(`reasoning ${result.effort} · next request`)
   }
 
-  async submit(raw: string): Promise<void> {
+  submit(raw: string): Promise<void> {
+    return this.enqueueAction(() => this.processSubmission(raw))
+  }
+
+  private async processSubmission(raw: string): Promise<void> {
     if (this.closing || raw.trim() === '') return
     const input = parseInput(raw)
     if (input.kind === 'prompt') {
@@ -507,14 +562,14 @@ export class DshTuiRunner {
         await this.shutdown(true)
         return
       case 'new':
-        await this.switchSession()
+        await this.requestSessionSwitch()
         return
       case 'resume':
         if (input.argument === '') await this.chooseSession()
-        else await this.switchSession(input.argument)
+        else await this.requestSessionSwitch(input.argument)
         return
       case 'sessions':
-        await this.showSessions()
+        await this.chooseSession()
         return
       case 'models':
         await this.showModels()
@@ -567,6 +622,8 @@ export class DshTuiRunner {
 
   interrupt(): void {
     if (this.handle === undefined) return
+    const sessionLoad = this.sessionLoadAbort
+    if (sessionLoad !== undefined) sessionLoad.abort(new Error('session loading cancelled'))
     if (this.agent.status === 'running') {
       this.agent.cancel({ kind: 'user' }, { keepInbox: true })
       this.ui.setStatus('stopping current turn…')
@@ -575,10 +632,64 @@ export class DshTuiRunner {
     }
   }
 
+  private pendingInboxCount(): number {
+    if (this.handle === undefined) return 0
+    return this.agent.inbox.nextTurn.length + this.agent.inbox.nextStep.length
+  }
+
+  private blockSessionChangeForPending(): boolean {
+    const count = this.pendingInboxCount()
+    if (count === 0) return false
+    const status = `wait for ${count} queued ${count === 1 ? 'message' : 'messages'} before changing sessions`
+    this.ui.setStatus(status)
+    this.ui.flashStatus(status)
+    return true
+  }
+
+  private async requestSessionSwitch(resumeId?: string): Promise<void> {
+    if (resumeId !== undefined && resumeId === String(this.agent.id)) return
+    if (this.blockSessionChangeForPending()) return
+
+    // Validate a direct resume target before the current agent is stopped.
+    if (resumeId !== undefined) await this.ctx.sessionPersistence.inspect(SessionId(resumeId))
+
+    if (this.agent.status === 'running') {
+      const target = resumeId === undefined ? 'create a new session' : 'open the selected session'
+      const choice = await this.ui.choose(
+        `The current turn is still running. Stop it and ${target}?`,
+        [
+          { value: 'stay', label: 'Stay here', description: 'Keep the current turn running' },
+          { value: 'switch', label: 'Stop and switch', description: 'Stop this turn, save it, and change sessions' },
+        ],
+        undefined,
+        { initialValue: 'stay' },
+      )
+      if (choice?.value !== 'switch') return
+    }
+
+    // A message may have been queued while the confirmation was open.
+    if (this.blockSessionChangeForPending()) return
+    await this.switchSession(resumeId)
+  }
+
   private async switchSession(resumeId?: string): Promise<void> {
     this.ui.setStatus(resumeId ? `opening ${resumeId}…` : 'creating a new session…')
+    const previousId = String(this.agent.id)
+    const previousSelection = this.selection?.current
     await this.detachCurrent()
-    await this.open(resumeId)
+    try {
+      await this.open(resumeId)
+    } catch (error) {
+      try {
+        await this.open(previousId, previousSelection)
+        this.ui.appendNotice(`Session change failed; restored ${previousId}`)
+      } catch {
+        await this.open(undefined, previousSelection)
+        this.ui.appendNotice('Session change failed; opened a fresh session because the previous session could not be restored.')
+      }
+      this.refresh()
+      throw error
+    }
     this.ui.appendLaunchBanner(
       String(this.agent.id),
       this.agent.session.header.cwd ?? resolve(this.startup.cwd ?? process.cwd()),
@@ -589,45 +700,114 @@ export class DshTuiRunner {
 
   private async detachCurrent(): Promise<void> {
     if (this.handle === undefined) return
-    this.sessionGeneration += 1
-    this.agent.cancel({ kind: 'user' }, { keepInbox: true })
-    await this.agent.whenIdle()
-    await this.ctx.sessions.flush(this.agent.session)
-    while (this.subscriptions.length > 0) this.subscriptions.pop()?.()
     const handle = this.handle
+    const agent = handle.agent
+    this.sessionGeneration += 1
+    agent.cancel({ kind: 'user' }, { keepInbox: true })
+    await agent.whenIdle()
+    await this.ctx.sessions.flush(agent.session)
+    await handle.dispose()
+    if (this.handle !== handle) return
+    while (this.subscriptions.length > 0) this.subscriptions.pop()?.()
     this.handle = undefined
     this.selection = undefined
     this.projection = undefined
     this.projectionCursor = 0
     this.selectedContextWindow = undefined
-    await handle.dispose()
-  }
-
-  private async showSessions(): Promise<void> {
-    const sessions = await this.ctx.sessionPersistence.list()
-    sessions.sort((left, right) => right.createdAt - left.createdAt)
-    const lines = sessions.slice(0, 30).map(header =>
-      `- ${header.id} · ${new Date(header.createdAt).toLocaleString()}${header.cwd ? ` · ${header.cwd}` : ''}`)
-    this.ui.appendNotice(`Persisted sessions (${sessions.length})\n${lines.join('\n') || 'None yet.'}`)
   }
 
   private async chooseSession(): Promise<void> {
-    const items = await this.loadSessionPickerItems()
-    if (items.length === 0) {
-      this.ui.appendNotice('No other persisted sessions are available.')
+    this.ui.setStatus('loading sessions…')
+    const abort = new AbortController()
+    this.sessionLoadAbort = abort
+    let items: PickerItem[]
+    try {
+      items = await this.loadSessionPickerItems(abort.signal)
+    } catch (error) {
+      if (abort.signal.aborted) {
+        this.ui.setStatus('session loading cancelled')
+        return
+      }
+      throw error
+    } finally {
+      if (this.sessionLoadAbort === abort) this.sessionLoadAbort = undefined
+    }
+    const currentId = String(this.agent.id)
+    const choice = await this.ui.chooseSearchable('Sessions', items, undefined, {
+      initialValue: currentId,
+      emptyText: 'No matching sessions',
+    })
+    if (choice === undefined || choice.value === currentId) {
+      this.ui.setStatus('ready')
       return
     }
-    const choice = await this.ui.choose('Resume a persisted session', items)
-    if (choice !== undefined) await this.switchSession(choice.value)
+    await this.requestSessionSwitch(choice.value)
   }
 
-  private async loadSessionPickerItems(): Promise<PickerItem[]> {
-    const sessions = await this.ctx.sessionPersistence.list()
-    return sessionPickerItems(sessions.map(header => ({
+  private async loadSessionPickerItems(signal?: AbortSignal): Promise<PickerItem[]> {
+    const snapshots = await this.ctx.sessionPersistence.listSnapshots(signal)
+    signal?.throwIfAborted()
+    const visible = snapshots.filter(snapshot => snapshot.header.origin !== 'subagent')
+    const visibleIds = new Set(visible.map(snapshot => String(snapshot.header.id)))
+    for (const id of this.sessionNavigatorCache.keys()) {
+      if (!visibleIds.has(id)) this.sessionNavigatorCache.delete(id)
+    }
+
+    const currentId = String(this.agent.id)
+    const sources = await mapWithConcurrency(
+      visible,
+      8,
+      snapshot => this.loadSessionPickerSource(snapshot, currentId, signal),
+    )
+    if (!visibleIds.has(currentId) && this.agent.session.header.origin !== 'subagent') {
+      sources.push(this.liveSessionPickerSource())
+    }
+    return sessionPickerItems(sources)
+  }
+
+  private async loadSessionPickerSource(
+    snapshot: SessionPersistenceSnapshot,
+    currentId: string,
+    signal?: AbortSignal,
+  ): Promise<SessionPickerSource> {
+    signal?.throwIfAborted()
+    const id = String(snapshot.header.id)
+    if (id === currentId) return this.liveSessionPickerSource()
+    const revision = String(snapshot.revision)
+    const cached = this.sessionNavigatorCache.get(id)
+    if (cached?.revision === revision) return cached.source
+    try {
+      const inspected = await this.ctx.sessionPersistence.inspect(snapshot.header.id, signal)
+      const source = this.sessionPickerSource(inspected.meta, inspected.events)
+      this.sessionNavigatorCache.set(id, { revision, source })
+      return source
+    } catch {
+      signal?.throwIfAborted()
+      return this.sessionPickerSource(snapshot.header, [], { titleUnavailable: true })
+    }
+  }
+
+  private liveSessionPickerSource(): SessionPickerSource {
+    return this.sessionPickerSource(this.agent.session.header, this.agent.session.events, {
+      current: true,
+      running: this.agent.status === 'running',
+    })
+  }
+
+  private sessionPickerSource(
+    header: Agent['session']['header'],
+    events: readonly SessionEvent[],
+    state: Pick<SessionPickerSource, 'current' | 'running' | 'titleUnavailable'> = {},
+  ): SessionPickerSource {
+    return {
       id: String(header.id),
+      title: foldSessionTitle(events)?.title,
       cwd: header.cwd,
       createdAt: header.createdAt,
-    }))).filter(item => item.value !== String(this.agent.id)).slice(0, 30)
+      updatedAt: updatedAt(events, header.createdAt),
+      parentSession: header.parentSession === undefined ? undefined : String(header.parentSession),
+      ...state,
+    }
   }
 
   private permissionPickerItems(): PickerItem[] {
@@ -987,6 +1167,7 @@ export class DshTuiRunner {
   async shutdown(requestExit: boolean, stopUi = true): Promise<void> {
     if (this.closing) return
     this.closing = true
+    this.sessionLoadAbort?.abort(new Error('TUI shutting down'))
     try {
       if (stopUi && this.started) this.ui.stop()
       await this.detachCurrent()

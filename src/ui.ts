@@ -2,6 +2,7 @@ import {
   CombinedAutocompleteProvider,
   Container,
   Editor,
+  Input,
   Key,
   Markdown,
   ProcessTerminal,
@@ -11,6 +12,7 @@ import {
   Text,
   TuiAltScreen,
   VStack,
+  fuzzyFilter,
   isKeyRelease,
   matchesKey,
   truncateToWidth,
@@ -18,6 +20,7 @@ import {
   type Component,
   type AutocompleteProvider,
   type EditorTheme,
+  type Focusable,
   type MarkdownTheme,
   type SelectItem,
   type SelectListTheme,
@@ -615,6 +618,14 @@ export interface ChooseOptions {
   priority?: 'optional' | 'required'
 }
 
+export interface SearchableSelectItem extends SelectItem {
+  searchText?: string
+}
+
+export interface SearchableChooseOptions extends ChooseOptions {
+  emptyText?: string
+}
+
 export interface SettingsChoice {
   id: string
   label: string
@@ -679,6 +690,78 @@ class CheckboxList implements Component {
       label: `${this.selected.has(item.value) ? '[x]' : '[ ]'} ${item.label}`,
     })), this.maxVisible, selectTheme)
     list.setSelectedIndex(this.selectedIndex)
+    return list
+  }
+}
+
+class SearchableSelectList implements Component, Focusable {
+  private readonly input = new Input()
+  private list: SelectList
+  private filteredItems: SearchableSelectItem[]
+  private isFocused = false
+  onSelect?: (item: SearchableSelectItem) => void
+  onCancel?: () => void
+
+  constructor(
+    private readonly items: SearchableSelectItem[],
+    private readonly maxVisible: number,
+    private readonly emptyText: string,
+    private readonly initialValue?: string,
+  ) {
+    this.filteredItems = items
+    this.list = this.createList()
+  }
+
+  get focused(): boolean {
+    return this.isFocused
+  }
+
+  set focused(value: boolean) {
+    this.isFocused = value
+    this.input.focused = value
+  }
+
+  invalidate(): void {
+    this.input.invalidate()
+    this.list.invalidate()
+  }
+
+  render(width: number): string[] {
+    const query = this.input.render(Math.max(1, width - 8))[0] ?? ''
+    const rows = this.filteredItems.length === 0
+      ? [dim(`  ${this.emptyText}`)]
+      : this.list.render(width)
+    return [`${dim('Search: ')}${query}`, '', ...rows]
+  }
+
+  handleInput(data: string): void {
+    if (matchesKey(data, Key.escape)) {
+      this.onCancel?.()
+      return
+    }
+    if (matchesKey(data, Key.enter)) {
+      const selected = this.list.getSelectedItem()
+      if (selected !== null) this.onSelect?.(selected)
+      return
+    }
+    if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
+      this.list.handleInput(data)
+      return
+    }
+    this.input.handleInput(data)
+    this.filteredItems = fuzzyFilter(this.items, this.input.getValue(), item =>
+      item.searchText ?? `${item.label} ${item.value} ${item.description ?? ''}`)
+    this.list = this.createList()
+  }
+
+  private createList(): SelectList {
+    const list = new SelectList(this.filteredItems, this.maxVisible, selectTheme)
+    if (this.input.getValue() === '' && this.initialValue !== undefined) {
+      const initialIndex = this.filteredItems.findIndex(item => item.value === this.initialValue)
+      if (initialIndex >= 0) list.setSelectedIndex(initialIndex)
+    }
+    list.onSelect = item => this.onSelect?.(item)
+    list.onCancel = () => this.onCancel?.()
     return list
   }
 }
@@ -948,6 +1031,51 @@ export class DeepSeekTui {
         cancel: () => settle(undefined),
       }
       this.openInteraction(title, list, '↑↓ move · Enter select · Esc close', interaction)
+      signal?.addEventListener('abort', abort, { once: true })
+    })
+  }
+
+  async chooseSearchable(
+    title: string,
+    items: SearchableSelectItem[],
+    signal?: AbortSignal,
+    options: SearchableChooseOptions = {},
+  ): Promise<SearchableSelectItem | undefined> {
+    if (signal?.aborted) return undefined
+    return await new Promise<SearchableSelectItem | undefined>((resolve) => {
+      const safeItems = items.map(item => ({
+        ...item,
+        label: `${item.value === options.initialValue ? '✓ ' : '  '}${sanitizeTerminalText(item.label)}`,
+        ...(item.description === undefined
+          ? {}
+          : { description: sanitizeTerminalText(item.description) }),
+        ...(item.searchText === undefined
+          ? {}
+          : { searchText: sanitizeTerminalText(item.searchText) }),
+      }))
+      const list = new SearchableSelectList(
+        safeItems,
+        Math.min(7, Math.max(3, safeItems.length)),
+        options.emptyText ?? 'No matching items',
+        options.initialValue,
+      )
+      let settled = false
+      const settle = (item: SearchableSelectItem | undefined): void => {
+        if (settled) return
+        settled = true
+        signal?.removeEventListener('abort', abort)
+        this.closeInteraction(interaction)
+        if (item === undefined) resolve(undefined)
+        else resolve(items.find(original => original.value === item.value))
+      }
+      const abort = (): void => settle(undefined)
+      list.onSelect = settle
+      list.onCancel = () => settle(undefined)
+      const interaction: ActiveInteraction = {
+        priority: options.priority ?? 'optional',
+        cancel: () => settle(undefined),
+      }
+      this.openInteraction(title, list, 'Type to search · ↑↓ move · Enter select · Esc close', interaction)
       signal?.addEventListener('abort', abort, { once: true })
     })
   }

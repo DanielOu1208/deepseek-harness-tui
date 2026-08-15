@@ -93,16 +93,24 @@ Common local commands:
 | Command | Purpose |
 |---|---|
 | `/help` | Show local and official Harness commands |
-| `/new`, `/resume` | Start or resume a session |
+| `/new` | Start a fresh session |
+| `/sessions`, `/resume` | Search sessions by title, ID, or working directory |
+| `/resume <session-id>` | Open a known session directly |
 | `/model`, `/reasoning` | Change the next model request |
-| `/permission` | Change tool access for this session |
+| `/permission <mode>` | Set `read-only`, `workspace-write`, or `danger-full-access` tool access |
 | `/settings` or F2 | Open the Pi-style settings list |
 | `/busy` | Choose queue or steer behavior while an agent is running |
+| `/queue <prompt>` | Queue a separate follow-up turn |
+| `/steer <prompt>` | Inject guidance at the next safe step of the active turn |
 | `/stop` | Stop the active turn and keep the TUI open |
 | `/pause` | Stop, flush, print the resume ID, and exit |
 | `/exit` | Flush and exit |
 
 The old singular `/setting` spelling remains accepted for compatibility, but is hidden from completion and help.
+
+The session navigator is sorted by recent activity and includes the current session, persisted non-subagent fork sessions, working directory, and short session ID. `/new` creates an unrelated session; creating a fork is not yet a TUI action. Subagent-owned sessions are hidden. Switching is blocked while queued messages are waiting, because disposing the active Harness agent would otherwise discard that queued work. If a turn is running without queued work, the TUI asks before stopping it.
+
+`danger-full-access` permits unrestricted tool access. Use it only when the current session and working directory are trusted.
 
 ### Transcript detail
 
@@ -156,6 +164,8 @@ deepseek launcher
 ```
 
 The bundle overlay is [`cordis.patch.yml`](cordis.patch.yml). It composes this startup parser and TUI runner over `@deepseek-ai/dsh-base`; it does not copy the Harness runtime into this repository.
+
+The living [Web–TUI capability parity matrix](docs/web-tui-parity.md) records what is supported, intentionally terminal-native, or still planned.
 
 ## Troubleshooting
 

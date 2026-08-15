@@ -9,6 +9,8 @@ export interface PickerItem {
     value: string;
     label: string;
     description?: string;
+    /** Optional text used by searchable pickers without changing the visible row. */
+    searchText?: string;
 }
 export declare const OTHER_ANSWER_VALUE = "answer:other";
 export declare function questionPickerItems(options: readonly {
@@ -25,8 +27,14 @@ export interface ModelPickerSource extends ModelRef {
 export declare function modelPickerItems(models: readonly ModelPickerSource[]): PickerItem[];
 export interface SessionPickerSource {
     id: string;
+    title?: string;
     cwd?: string;
     createdAt: number;
+    updatedAt?: number;
+    parentSession?: string;
+    current?: boolean;
+    running?: boolean;
+    titleUnavailable?: boolean;
 }
 export declare function sessionPickerItems(sessions: readonly SessionPickerSource[]): PickerItem[];
 export declare const PERMISSION_PICKER_ITEMS: readonly PickerItem[];

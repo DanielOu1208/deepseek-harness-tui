@@ -55,13 +55,16 @@ test('builds nested model picker items with provider-qualified values', () => {
 })
 
 test('builds resume and permission picker items', () => {
-  assert.deepEqual(sessionPickerItems([
-    { id: 'session-new', cwd: '/new', createdAt: 20 },
-    { id: 'session-old', cwd: '/old', createdAt: 10 },
-  ]), [
-    { value: 'session-new', label: 'session-new', description: '/new' },
-    { value: 'session-old', label: 'session-old', description: '/old' },
+  const sessions = sessionPickerItems([
+    { id: 'session-new', title: 'New work', cwd: '/new', createdAt: 20, updatedAt: 30, current: true, running: false },
+    { id: 'session-old', cwd: '/old', createdAt: 10, parentSession: 'session-parent' },
   ])
+  assert.deepEqual(sessions.map(item => ({ value: item.value, label: item.label, searchText: item.searchText })), [
+    { value: 'session-new', label: 'New work', searchText: 'New work session-new /new' },
+    { value: 'session-old', label: 'Untitled session', searchText: 'session-old /old' },
+  ])
+  assert.match(sessions[0]?.description ?? '', /^Current · idle · .* · \/new · session-new$/)
+  assert.match(sessions[1]?.description ?? '', /^Saved · .* · \/old · session-old · fork of session-parent$/)
   assert.deepEqual(PERMISSION_PICKER_ITEMS.map(item => item.value), [
     'read-only', 'workspace-write', 'danger-full-access',
   ])

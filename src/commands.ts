@@ -45,8 +45,8 @@ export const LOCAL_SLASH_COMMANDS: readonly SlashCommand[] = [
   { name: 'busy', description: 'Choose what plain Enter does while the agent is busy', argumentHint: '[queue|steer]' },
   { name: 'settings', description: 'Open the core TUI settings menu' },
   { name: 'queue', description: 'Queue a separate follow-up turn', argumentHint: '<prompt>' },
-  { name: 'resume', description: 'Open a persisted session', argumentHint: '<session-id>' },
-  { name: 'sessions', description: 'List persisted sessions' },
+  { name: 'resume', description: 'Search sessions or open one by ID', argumentHint: '[session-id]' },
+  { name: 'sessions', description: 'Search and switch sessions' },
   { name: 'steer', description: 'Steer the nearest active agent step', argumentHint: '<prompt>' },
   { name: 'stop', description: 'Stop the active turn' },
 ]
@@ -91,8 +91,8 @@ export function parseInput(input: string): ParsedInput {
 
 export const HELP_TEXT = `Local TUI commands:
   /new                       start a fresh session
-  /sessions                  list persisted sessions
-  /resume <session-id>       open a persisted session
+  /sessions                  search and switch sessions
+  /resume [session-id]       search sessions or open one by ID
   /models                    list available models
   /model <provider>/<model>  switch the next model request
   /reasoning <effort>        select model reasoning effort

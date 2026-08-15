@@ -502,6 +502,79 @@ test('blocks mode and reasoning shortcuts while a dialog is active', async () =>
   ui.stop()
 })
 
+test('searches picker metadata without changing the composer draft', async () => {
+  const terminal = new FakeTerminal()
+  const ui = new DeepSeekTui(terminal)
+  ui.start({
+    onPrompt: () => {},
+    onSettings: () => {},
+    onInterrupt: () => {},
+    onExit: () => {},
+  })
+  ui.editor.setText('keep this draft')
+
+  const pending = ui.chooseSearchable('Sessions', [
+    { value: 'session-current', label: 'Current work', searchText: 'Current work session-current /work/current' },
+    { value: 'session-old', label: 'Refactor parser', searchText: 'Refactor parser session-old /work/compiler' },
+  ], undefined, { initialValue: 'session-current' })
+  for (const character of 'compiler') terminal.send(character)
+  terminal.send('\r')
+
+  assert.equal((await pending)?.value, 'session-old')
+  assert.equal(ui.editor.getText(), 'keep this draft')
+
+  const titleSearch = ui.chooseSearchable('Sessions', [
+    { value: 'session-current', label: 'Current work', searchText: 'Current work session-current /work/current' },
+    { value: 'session-old', label: 'Refactor parser', searchText: 'Refactor parser session-old /work/compiler' },
+  ])
+  for (const character of 'refactor') terminal.send(character)
+  terminal.send('\r')
+  assert.equal((await titleSearch)?.value, 'session-old')
+  ui.stop()
+})
+
+test('preselects the current searchable item and sanitizes untrusted rows', async () => {
+  const terminal = new FakeTerminal()
+  const ui = new DeepSeekTui(terminal)
+  ui.start({
+    onPrompt: () => {},
+    onSettings: () => {},
+    onInterrupt: () => {},
+    onExit: () => {},
+  })
+  const unsafe = '\u001b]52;c;VEVTVA==\u0007'
+  const pending = ui.chooseSearchable('Sessions', [
+    { value: 'other', label: `Other${unsafe}`, description: `unsafe${unsafe}` },
+    { value: 'current', label: `Current${unsafe}`, searchText: `current${unsafe}` },
+  ], undefined, { initialValue: 'current' })
+  const rendered = ui.tui.getFocusedComponent()?.render(80).join('\n') ?? ''
+  assert.doesNotMatch(rendered, /\u001b\]52|VEVTVA/u)
+  terminal.send('\r')
+  assert.equal((await pending)?.value, 'current')
+  ui.stop()
+})
+
+test('keeps a searchable picker open on no matches and lets Escape cancel it', async () => {
+  const terminal = new FakeTerminal()
+  const ui = new DeepSeekTui(terminal)
+  ui.start({
+    onPrompt: () => {},
+    onSettings: () => {},
+    onInterrupt: () => {},
+    onExit: () => {},
+  })
+  const pending = ui.chooseSearchable('Sessions', [
+    { value: 'session-one', label: 'One session' },
+  ], undefined, { emptyText: 'No matching sessions' })
+  for (const character of 'missing') terminal.send(character)
+  const rendered = ui.tui.getFocusedComponent()?.render(80).join('\n') ?? ''
+  assert.match(rendered, /No matching sessions/)
+  terminal.send('\r')
+  terminal.send('\u001b')
+  assert.equal(await pending, undefined)
+  ui.stop()
+})
+
 test('required prompts replace optional input and restore the original composer draft', async () => {
   const ui = new DeepSeekTui(new FakeTerminal())
   ui.editor.setText('composer draft')

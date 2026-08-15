@@ -13,6 +13,8 @@ export interface PickerItem {
   value: string
   label: string
   description?: string
+  /** Optional text used by searchable pickers without changing the visible row. */
+  searchText?: string
 }
 
 export const OTHER_ANSWER_VALUE = 'answer:other'
@@ -59,17 +61,36 @@ export function modelPickerItems(models: readonly ModelPickerSource[]): PickerIt
 
 export interface SessionPickerSource {
   id: string
+  title?: string
   cwd?: string
   createdAt: number
+  updatedAt?: number
+  parentSession?: string
+  current?: boolean
+  running?: boolean
+  titleUnavailable?: boolean
+}
+
+function shortSessionId(id: string): string {
+  return id.length <= 16 ? id : `…${id.slice(-12)}`
 }
 
 export function sessionPickerItems(sessions: readonly SessionPickerSource[]): PickerItem[] {
   return [...sessions]
-    .sort((left, right) => right.createdAt - left.createdAt)
+    .sort((left, right) => (right.updatedAt ?? right.createdAt) - (left.updatedAt ?? left.createdAt))
     .map(session => ({
       value: session.id,
-      label: session.id,
-      description: session.cwd ?? 'Persisted session',
+      label: session.title ?? 'Untitled session',
+      description: [
+        session.current ? `Current · ${session.running ? 'running' : 'idle'}` : 'Saved',
+        new Date(session.updatedAt ?? session.createdAt).toLocaleString(),
+        session.cwd,
+        shortSessionId(session.id),
+        session.parentSession === undefined ? undefined : `fork of ${shortSessionId(session.parentSession)}`,
+        session.titleUnavailable ? 'title unavailable' : undefined,
+      ].filter((part): part is string => part !== undefined).join(' · '),
+      searchText: [session.title, session.id, session.cwd]
+        .filter((part): part is string => part !== undefined).join(' '),
     }))
 }
 
