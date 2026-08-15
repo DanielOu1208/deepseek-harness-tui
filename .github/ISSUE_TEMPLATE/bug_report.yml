@@ -57,4 +57,3 @@ body:
       options:
         - label: I removed credentials and private session data from this report.
           required: true
-

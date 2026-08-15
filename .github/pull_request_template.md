@@ -17,4 +17,3 @@
 - [ ] Generated files under `lib/` match the TypeScript source.
 - [ ] New dependencies are necessary and explained above.
 - [ ] User-facing behavior or compatibility changes are documented.
-
