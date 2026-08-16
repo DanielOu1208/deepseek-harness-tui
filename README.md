@@ -9,9 +9,9 @@
 [![Node.js 22.19+](https://img.shields.io/badge/Node.js-22.19%2B-3c873a?logo=nodedotjs&logoColor=white)](package.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-4d6bfe.svg)](LICENSE)
 
-<img src="docs/assets/tui-preview.svg" width="920" alt="Interface preview of DeepSeek Harness TUI showing settings, keyboard shortcuts, and context usage">
+<img src="docs/assets/tui-terminal.png" width="920" alt="Actual DeepSeek Harness TUI terminal showing its startup banner, keyboard shortcuts, composer, model, permissions, context capacity, and idle state">
 
-<sub>Interface preview with sample data. The official Harness remains responsible for models, tools, permissions, sessions, and credentials.</sub>
+<sub>Actual capture from the compiled TUI using an isolated Harness home. No model request or private session data was used.</sub>
 
 </div>
 
