@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { buildSlashCommands, formatCommandHelp, parseInput } from '../src/commands.js'
+import { LOCAL_SLASH_COMMANDS, buildSlashCommands, formatCommandHelp, parseInput } from '../src/commands.js'
 
 test('parses local lifecycle commands and arguments', () => {
   assert.deepEqual(parseInput('/new'), { kind: 'local', name: 'new', argument: '' })
@@ -21,6 +21,15 @@ test('passes official harness slash commands through untouched', () => {
 
 test('plain input is a prompt', () => {
   assert.deepEqual(parseInput('fix the tests'), { kind: 'prompt', text: 'fix the tests' })
+})
+
+test('parses every registered local slash command locally', () => {
+  assert.equal(new Set(LOCAL_SLASH_COMMANDS.map(command => command.name)).size, LOCAL_SLASH_COMMANDS.length)
+  for (const command of LOCAL_SLASH_COMMANDS) {
+    assert.deepEqual(parseInput(`/${command.name} example`), {
+      kind: 'local', name: command.name, argument: 'example',
+    })
+  }
 })
 
 test('builds one discoverable slash-command catalog from local and Harness commands', () => {

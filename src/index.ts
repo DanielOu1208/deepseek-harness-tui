@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/cordis-plugin-loader'
 import {
@@ -12,39 +12,35 @@ import {
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type {} from '@deepseek-ai/dsh-cmdline'
 import type {} from '@deepseek-ai/dsh-commands'
+import type {} from '@deepseek-ai/dsh-plan-mode'
+import type {} from '@deepseek-ai/dsh-session-projection'
+import type {} from '@deepseek-ai/dsh-session-stats'
+import type {} from '@deepseek-ai/dsh-token-meter'
+import type {} from '@deepseek-ai/dsh-workspace'
+import type {} from '@deepseek-ai/dsh-host-plugin-inventory'
+import type {} from '@deepseek-ai/dsh-jobs'
+import type {} from '@deepseek-ai/dsh-subagent'
+import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
-import { PERMISSION_SETTINGS_NAMESPACE } from '@deepseek-ai/dsh-permission-presets'
-import type {} from '@deepseek-ai/dsh-session-persistence'
 import type { SettingsScope } from '@deepseek-ai/dsh-settings'
 import type { ToolResult } from '@deepseek-ai/dsh-tools'
-import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
-import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
-import type {
-  AskUserQuestionAnswer,
-  AskUserQuestionItem,
-  AskUserQuestionRequest,
-} from '@deepseek-ai/dsh-user-questions'
-import { buildSlashCommands, formatCommandHelp, parseInput } from './commands.js'
+import { SessionId } from '@deepseek-ai/dsh-session'
+import { buildSlashCommands, formatCommandHelp, parseInput, type LocalCommandName } from './commands.js'
+import { createSessionDraftStore, type SessionDraftStoreLike } from './drafts.js'
 import {
-  BUSY_PICKER_ITEMS,
   GOAL_PICKER_ITEMS,
-  OTHER_ANSWER_VALUE,
   PLAN_PICKER_ITEMS,
-  SETTINGS_PICKER_ITEMS,
   filterPickerItems,
-  modelPickerItems,
-  parseModelRef,
-  parseSettingsPatch,
-  questionLabelsFromValues,
-  questionPickerItems,
-  reasoningInitialValue,
-  reasoningPickerItems,
-  sessionPickerItems,
-  settingsNamespacePickerItems,
-  type ModelPickerSource,
-  type PickerItem,
+  stepReasoningEffort,
+  type ReasoningStepDirection,
 } from './interaction.js'
-import { createProjection, foldSessionEvent, type ProjectionState, type ToolPresenter } from './projection.js'
+import { PromptController, type PromptControllerApi } from './prompt-controller.js'
+import { createProjection, foldSessionEvent, projectSession, type ProjectionState, type ToolPresenter } from './projection.js'
+import { QueueController } from './queue-controller.js'
+import { SessionInsightsController } from './session-insights.js'
+import { forkSeedEvents, modelSelectionFromEvents } from './session-lifecycle.js'
+import { SessionNavigator } from './session-navigator.js'
+import { SettingsController } from './settings-controller.js'
 import type { TuiStartupOptions } from './startup.js'
 import {
   DEFAULT_TRANSCRIPT_DENSITY,
@@ -59,12 +55,21 @@ import { DeepSeekTui, sanitizeTerminalText } from './ui.js'
 export const name = 'dsh-tui-runner'
 export const inject = [
   'dshTuiStartup',
+  'attachments',
   'agentDefaultModel',
   'agents',
   'sessions',
   'sessionPersistence',
+  'sessionTitle',
   'commands',
+  'planMode',
   'permissionPresets',
+  'sessionProjections',
+  'tokenMeter',
+  'workspaceRegistry',
+  'pluginInventory',
+  'jobs',
+  'subagents',
   'settings',
   'tools',
   'llm',
@@ -76,56 +81,90 @@ function message(text: string) {
   return createUserMessage({ content: [{ type: 'text' as const, text }], source: { kind: 'user' as const } })
 }
 
-function modelFromEvents(events: readonly SessionEvent[], fallback: ModelSelection): ModelSelection {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index]
-    if (event?.type !== 'request/header') continue
-    const config = event.data.header.config
-    return {
-      provider: config.provider,
-      model: config.model,
-      ...(config.reasoningEffort === undefined ? {} : { reasoningEffort: config.reasoningEffort }),
-    }
-  }
-  return fallback
-}
-
-function questionTitle(question: AskUserQuestionItem): string {
-  return [
-    question.header ? `## ${question.header}` : undefined,
-    question.question,
-    question.detail,
-  ].filter((part): part is string => Boolean(part)).join('\n\n')
+interface PreparedSession {
+  handle: AgentHandle
+  selection: ModelSelectionRef
+  contextWindow?: number
 }
 
 export class DshTuiRunner {
   private handle?: AgentHandle
   private selection?: ModelSelectionRef
   private readonly subscriptions: Array<() => void> = []
-  private readonly interactionDisposers: Array<() => void> = []
-  private busyEnter: 'queue' | 'steer' = 'queue'
   private projection?: ProjectionState
   private projectionCursor = 0
   private closing = false
   private started = false
-  private localTranscriptDensity: TranscriptDensity = DEFAULT_TRANSCRIPT_DENSITY
+  private startPromise?: Promise<void>
+  private shutdownPromise?: Promise<void>
+  private readonly startupAbort = new AbortController()
+  private sessionTransitionAbort?: AbortController
+  private sessionTransitionPromise?: Promise<void>
+  private commandAbort?: AbortController
+  private commandPromise?: Promise<void>
+  private selectedContextWindow?: number
+  private shortcutQueue: Promise<void> = Promise.resolve()
+  private actionQueue: Promise<void> = Promise.resolve()
+  private sessionGeneration = 0
+  private readonly sessionInsights: SessionInsightsController
+  private readonly sessionNavigator: SessionNavigator
+  private readonly queueController: QueueController
+  private readonly settingsController: SettingsController
+  private readonly promptController: PromptControllerApi
 
   constructor(
     private readonly ctx: Context,
     private readonly startup: TuiStartupOptions,
     private readonly ui = new DeepSeekTui(),
     private readonly transcriptSettings?: SettingsScope<TranscriptSettings>,
+    draftStore: SessionDraftStoreLike = createSessionDraftStore(
+      join(resolveDshHome(), 'tui', 'drafts', 'v1'),
+    ),
+    promptController?: PromptControllerApi,
   ) {
-    if (this.transcriptSettings !== undefined) {
-      this.ui.setTranscriptDensity(this.transcriptSettings.get().transcriptDensity)
-      this.interactionDisposers.push(this.transcriptSettings.watch(next => {
-        this.ui.setTranscriptDensity(next.transcriptDensity)
-      }))
-    }
+    this.promptController = promptController ?? new PromptController({
+      ctx: this.ctx,
+      ui: this.ui,
+      draftStore,
+      startupCwd: this.startup.cwd,
+      getAgent: () => this.handle?.agent,
+      getSelection: () => this.selection,
+      isClosing: () => this.closing,
+    })
+    this.sessionInsights = new SessionInsightsController({
+      ctx: this.ctx,
+      ui: this.ui,
+      startupCwd: this.startup.cwd,
+      getCurrentSession: () => ({ agent: this.agent, generation: this.sessionGeneration }),
+    })
+    this.sessionNavigator = new SessionNavigator({
+      ctx: this.ctx,
+      ui: this.ui,
+      getAgent: () => this.agent,
+      requestSwitch: id => this.requestSessionSwitch(id),
+    })
+    this.queueController = new QueueController({
+      ui: this.ui,
+      getAgent: () => this.agent,
+      isClosing: () => this.closing,
+    })
+    this.settingsController = new SettingsController({
+      ctx: this.ctx,
+      ui: this.ui,
+      transcriptSettings: this.transcriptSettings,
+      startupCwd: this.startup.cwd,
+      getAgent: () => this.agent,
+      getSelection: () => this.selection,
+      setSelectedContextWindow: value => { this.selectedContextWindow = value },
+      runHarnessCommand: line => this.runHarnessCommand(line),
+      refresh: () => this.refresh(),
+      isClosing: () => this.closing,
+      hasPendingImages: () => this.promptController.hasPendingImages(),
+    })
   }
 
   private get transcriptDensity(): TranscriptDensity {
-    return this.transcriptSettings?.get().transcriptDensity ?? this.localTranscriptDensity
+    return this.settingsController.transcriptDensity
   }
 
   private get agent(): Agent {
@@ -133,114 +172,52 @@ export class DshTuiRunner {
     return this.handle.agent
   }
 
-  async start(): Promise<void> {
+  start(): Promise<void> {
+    this.startPromise ??= this.startInternal().catch((error: unknown) => {
+      if (this.closing && this.startupAbort.signal.aborted) return
+      throw error
+    })
+    return this.startPromise
+  }
+
+  private async startInternal(): Promise<void> {
     await this.ctx.get('loader')?.await()
-    if (this.closing) return
-    this.installInteractions()
-    await this.open(this.startup.resume)
+    this.startupAbort.signal.throwIfAborted()
+    this.promptController.installInteractions()
+    await this.open(this.startup.resume, undefined, this.startupAbort.signal)
+    this.startupAbort.signal.throwIfAborted()
+    await this.promptController.restoreCurrentDraft()
+    this.startupAbort.signal.throwIfAborted()
     this.ui.appendLaunchBanner(
       String(this.agent.id),
       this.agent.session.header.cwd ?? resolve(this.startup.cwd ?? process.cwd()),
     )
     this.ui.start({
       onPrompt: text => this.submit(text),
-      onSettings: () => this.chooseSettings(),
+      onDraftChange: text => this.promptController.scheduleDraftSave(text),
+      onPasteImage: () => this.enqueueAction(() => this.promptController.pasteClipboardImage()),
+      onSettings: () => this.enqueueAction(() => this.settingsController.chooseSettings()),
+      onTogglePlanMode: () => this.enqueueAction(() => this.enqueueShortcut(() => this.togglePlanMode())),
+      onReasoningStep: direction => this.enqueueAction(() => this.enqueueShortcut(() => this.stepReasoning(direction))),
       onInterrupt: () => this.interrupt(),
-      onExit: () => this.shutdown(true),
+      onExit: () => this.enqueueAction(() => this.shutdownFromAction(true)),
     })
     this.started = true
     this.refresh()
     if (this.startup.prompt !== undefined) await this.submit(this.startup.prompt)
   }
 
-  private installInteractions(): void {
-    const userQuestions = this.ctx.get('userQuestions')
-    const questionDispose = userQuestions?.registerProvider({
-      ask: request => this.askQuestions(request),
-    })
-    if (questionDispose !== undefined) this.interactionDisposers.push(questionDispose)
-
-    this.interactionDisposers.push(this.ctx.on('approval/request', (request, next) => {
-      if (this.handle === undefined || request.agent !== this.handle.agent) return next()
-      return this.askApproval(request)
-    }))
-  }
-
-  private async askApproval(request: ApprovalRequest): Promise<ApprovalOutcome> {
-    const choice = await this.ui.choose(
-      `Permission request\n\nTool: ${request.toolName}${request.reason ? `\nReason: ${request.reason}` : ''}`,
-      [
-        { value: 'allow', label: 'Allow once', description: 'Run this action once' },
-        { value: 'reject', label: 'Reject', description: 'Deny this action' },
-      ],
-      request.signal,
-      { initialValue: 'reject', priority: 'required' },
-    )
-    if (request.signal?.aborted) return 'cancelled'
-    return choice?.value === 'allow' ? 'allowed-once' : choice?.value === 'reject' ? 'rejected' : 'cancelled'
-  }
-
-  private async askQuestions(request: AskUserQuestionRequest): Promise<AskUserQuestionAnswer> {
-    if (request.agent !== undefined && request.agent !== this.handle?.agent) {
-      throw new Error('question belongs to a different agent')
-    }
-    const answers: AskUserQuestionAnswer['answers'] = []
-    for (const question of request.questions) {
-      if (request.signal?.aborted) throw new Error('question cancelled')
-      const title = questionTitle(question)
-      const options = question.options ?? []
-      const optionItems = questionPickerItems(options)
-      if (question.multiSelect) {
-        if (options.length === 0) {
-          const custom = await this.ui.promptText(`${title}\n\nType your answer:`, request.signal, { priority: 'required' })
-          if (custom === undefined) throw new Error('question cancelled')
-          answers.push({ id: question.id, selected: [], custom })
-          continue
-        }
-        const selected = await this.ui.chooseMany(title, [
-          ...optionItems,
-          { value: OTHER_ANSWER_VALUE, label: 'Other…', description: 'Add a custom answer' },
-        ], request.signal, { priority: 'required' })
-        if (selected === undefined) throw new Error('question cancelled')
-        const customRequested = selected.some(item => item.value === OTHER_ANSWER_VALUE)
-        const labels = questionLabelsFromValues(selected.map(item => item.value), options)
-        if (!customRequested) {
-          answers.push({ id: question.id, selected: labels })
-          continue
-        }
-        const custom = await this.ui.promptText(`${title}\n\nType the additional answer:`, request.signal, { priority: 'required' })
-        if (custom === undefined) throw new Error('question cancelled')
-        answers.push({ id: question.id, selected: labels, custom })
-        continue
-      }
-      if (options.length > 0) {
-        const choice = await this.ui.choose(title, [
-          ...optionItems,
-          { value: OTHER_ANSWER_VALUE, label: 'Other…', description: 'Type a custom answer' },
-        ], request.signal, { priority: 'required' })
-        if (choice === undefined) throw new Error('question cancelled')
-        if (choice.value !== OTHER_ANSWER_VALUE) {
-          const labels = questionLabelsFromValues([choice.value], options)
-          if (labels[0] === undefined) throw new Error('question choice is no longer available')
-          answers.push({ id: question.id, selected: [labels[0]] })
-          continue
-        }
-      }
-      const custom = await this.ui.promptText(`${title}\n\nType your answer:`, request.signal, { priority: 'required' })
-      if (custom === undefined) throw new Error('question cancelled')
-      answers.push({ id: question.id, selected: [], custom })
-    }
-    return { answers }
-  }
-
-  private async open(resumeId?: string): Promise<void> {
-    const defaultSelection = this.ctx.agentDefaultModel.currentSelection()
-    let selected = defaultSelection
-    if (resumeId !== undefined) {
-      const inspected = await this.ctx.sessionPersistence.inspect(SessionId(resumeId))
-      selected = modelFromEvents(inspected.events, defaultSelection)
-    }
+  private async prepareSession(
+    resumeId?: string,
+    fallbackSelection?: ModelSelection,
+    signal?: AbortSignal,
+    resolvedSelection?: ModelSelection,
+  ): Promise<PreparedSession> {
+    const defaultSelection = fallbackSelection ?? this.ctx.agentDefaultModel.currentSelection()
+    const selected = resolvedSelection ?? await this.resolveSessionSelection(resumeId, defaultSelection, signal)
     const selection: ModelSelectionRef = { current: selected, assembled: undefined }
+    const contextWindow = await this.resolveContextWindow(selected, signal)
+    signal?.throwIfAborted()
     const setup = (agentCtx: Context): void => { installModelSelection(agentCtx, selection) }
     const handle = resumeId === undefined
       ? await this.ctx.agents.create({
@@ -248,15 +225,58 @@ export class DshTuiRunner {
           meta: { cwd: resolve(this.startup.cwd ?? process.cwd()) },
           agentOptions: { provider: selected.provider, model: selected.model },
           setup,
+          signal,
         })
       : await this.ctx.agents.resume({
           resumeSessionId: SessionId(resumeId),
           agentOptions: { provider: selected.provider, model: selected.model },
           setup,
+          signal,
         })
-    this.handle = handle
-    this.selection = selection
-    this.bindAgent(handle.agent)
+    if (signal?.aborted) {
+      await handle.dispose()
+      signal.throwIfAborted()
+    }
+    return { handle, selection, contextWindow }
+  }
+
+  private async resolveSessionSelection(
+    resumeId: string | undefined,
+    fallback: ModelSelection,
+    signal?: AbortSignal,
+  ): Promise<ModelSelection> {
+    if (resumeId === undefined) return fallback
+    const inspected = await this.ctx.sessionPersistence.inspect(SessionId(resumeId), signal)
+    signal?.throwIfAborted()
+    return modelSelectionFromEvents(inspected.events, fallback)
+  }
+
+  private activateSession(prepared: PreparedSession): void {
+    this.handle = prepared.handle
+    this.selection = prepared.selection
+    this.selectedContextWindow = prepared.contextWindow
+    this.bindAgent(prepared.handle.agent)
+  }
+
+  private async open(
+    resumeId?: string,
+    fallbackSelection?: ModelSelection,
+    signal?: AbortSignal,
+    resolvedSelection?: ModelSelection,
+  ): Promise<void> {
+    this.activateSession(await this.prepareSession(resumeId, fallbackSelection, signal, resolvedSelection))
+    await this.attachCurrentWorkspace()
+  }
+
+  private async attachCurrentWorkspace(): Promise<void> {
+    const cwd = this.agent.session.header.cwd
+    if (cwd === undefined) return
+    try {
+      const workspace = await this.ctx.workspaceRegistry.create(cwd)
+      await workspace.attachSession(this.agent.session.id)
+    } catch {
+      // A missing historical directory must not prevent its session from opening.
+    }
   }
 
   private bindAgent(agent: Agent): void {
@@ -284,28 +304,34 @@ export class DshTuiRunner {
       switch (command.name) {
         case 'model':
           command.getArgumentCompletions = async prefix =>
-            filterPickerItems(modelPickerItems(await this.loadModels()), prefix)
+            this.settingsController.modelCompletions(prefix)
           break
         case 'resume':
           command.getArgumentCompletions = async prefix =>
-            filterPickerItems(await this.loadSessionPickerItems(), prefix)
+            filterPickerItems(await this.sessionNavigator.loadPickerItems(), prefix)
+          break
+        case 'session':
+          command.getArgumentCompletions = async prefix =>
+            filterPickerItems(await this.sessionNavigator.loadPickerItems(), prefix)
+          break
+        case 'sessions':
+          command.getArgumentCompletions = prefix => filterPickerItems([
+            { value: 'archived', label: 'archived', description: 'Browse one-way archived sessions' },
+          ], prefix)
           break
         case 'permission':
           command.getArgumentCompletions = prefix =>
-            filterPickerItems(this.permissionPickerItems(), prefix)
+            filterPickerItems(this.settingsController.permissionPickerItems(), prefix)
           break
         case 'reasoning':
           command.getArgumentCompletions = async prefix =>
-            filterPickerItems(await this.loadReasoningPickerItems(), prefix)
+            filterPickerItems(await this.settingsController.loadReasoningPickerItems(), prefix)
           break
         case 'busy':
-          command.getArgumentCompletions = prefix => filterPickerItems(BUSY_PICKER_ITEMS, prefix)
+          command.getArgumentCompletions = prefix => this.settingsController.busyCompletions(prefix)
           break
         case 'settings':
-          command.getArgumentCompletions = prefix => filterPickerItems([
-            ...SETTINGS_PICKER_ITEMS,
-            ...this.loadSettingsNamespacePickerItems(),
-          ], prefix)
+          command.getArgumentCompletions = prefix => this.settingsController.settingCompletions(prefix)
           break
         case 'goal':
           command.getArgumentCompletions = prefix => filterPickerItems([
@@ -349,24 +375,199 @@ export class DshTuiRunner {
       state.provider = this.selection.current.provider
       state.model = this.selection.current.model
       state.reasoningEffort = this.selection.current.reasoningEffort
+      const requestContext = state.requestContext
+      const routeMatches = requestContext?.provider === this.selection.current.provider
+        && requestContext.model === this.selection.current.model
+      const capacityTokens = this.selectedContextWindow ?? (routeMatches ? requestContext?.contextWindow : undefined)
+      if (capacityTokens !== undefined) {
+        const pressure = this.ctx.sessionProjections.snapshot(this.agent.session).values.contextPressure
+        const usedTokens = routeMatches && state.contextUsageReady
+          ? pressure?.projectedTokens ?? pressure?.pressureTokens
+          : undefined
+        state.contextWindow = {
+          capacityTokens,
+          ...(usedTokens === undefined ? {} : { usedTokens }),
+        }
+      }
     }
     this.ui.renderProjection(state)
   }
 
-  async submit(raw: string): Promise<void> {
+  private async resolveContextWindow(selection: ModelSelection, signal?: AbortSignal): Promise<number | undefined> {
+    try {
+      const info = await this.ctx.llm.resolveModelInfo(selection.provider, selection.model, signal)
+      const contextWindow = info.context?.contextWindow
+      return typeof contextWindow === 'number' && Number.isInteger(contextWindow) && contextWindow > 0
+        ? contextWindow
+        : undefined
+    } catch {
+      signal?.throwIfAborted()
+      return undefined
+    }
+  }
+
+  private enqueueShortcut(action: () => Promise<void>): Promise<void> {
+    const generation = this.sessionGeneration
+    const runIfCurrent = async (): Promise<void> => {
+      if (generation === this.sessionGeneration) await action()
+    }
+    const queued = this.shortcutQueue.then(runIfCurrent, runIfCurrent)
+    this.shortcutQueue = queued.catch(() => {})
+    return queued
+  }
+
+  private enqueueAction(action: () => Promise<void>): Promise<void> {
+    const run = async (): Promise<void> => {
+      if (!this.closing) await action()
+    }
+    const queued = this.actionQueue.then(run, run)
+    this.actionQueue = queued.catch(() => {})
+    return queued
+  }
+
+  private async togglePlanMode(): Promise<void> {
+    const handle = this.handle
+    if (handle === undefined) throw new Error('no active DeepSeek session')
+    const generation = this.sessionGeneration
+    const agent = handle.agent
+    const current = this.ctx.planMode.get(agent)
+    const target = !(current.pending ?? current.active)
+    await this.runHarnessCommand(target ? '/plan' : '/plan off', agent)
+    if (generation !== this.sessionGeneration || this.handle !== handle) return
+    const next = this.ctx.planMode.get(agent)
+    const selected = next.pending ?? next.active
+    this.ui.setStatus(next.pending === undefined
+      ? `${selected ? 'plan' : 'build'} mode`
+      : `${selected ? 'plan' : 'build'} mode queued for the next step`)
+  }
+
+  private async stepReasoning(direction: ReasoningStepDirection): Promise<void> {
+    const handle = this.handle
+    const selectionRef = this.selection
+    const generation = this.sessionGeneration
+    if (handle === undefined) throw new Error('no active DeepSeek session')
+    if (selectionRef === undefined) throw new Error('model selection is unavailable')
+    const selection = selectionRef.current
+    if (selection === undefined) throw new Error('model selection is unavailable')
+    const info = await this.ctx.llm.resolveModelInfo(selection.provider, selection.model)
+    if (generation !== this.sessionGeneration
+      || this.handle !== handle
+      || this.selection !== selectionRef
+      || selectionRef.current !== selection) return
+    if (info.reasoning === undefined) {
+      const status = 'reasoning is not configurable for the current model'
+      this.ui.setStatus(status)
+      this.ui.flashStatus(status)
+      return
+    }
+    const result = stepReasoningEffort(info.reasoning, selection.reasoningEffort, direction)
+    if (result.kind === 'unavailable') {
+      const status = result.reason === 'no-efforts'
+        ? 'reasoning is not configurable for the current model'
+        : 'the current reasoning level is unknown; use /reasoning'
+      this.ui.setStatus(status)
+      this.ui.flashStatus(status)
+      return
+    }
+    if (result.kind === 'boundary') {
+      const status = `reasoning is already at ${result.effort}`
+      this.ui.setStatus(status)
+      this.ui.flashStatus(status)
+      return
+    }
+    selectionRef.current = {
+      provider: selection.provider,
+      model: selection.model,
+      reasoningEffort: ReasoningEffortId(result.effort),
+    }
+    this.refresh()
+    this.ui.setStatus(`reasoning ${result.effort} · next request`)
+  }
+
+  submit(raw: string): Promise<void> {
+    return this.enqueueAction(() => this.processSubmission(raw))
+  }
+
+  private localCommandHandlers(): Record<LocalCommandName, (argument: string) => Promise<void>> {
+    return {
+      help: async () => this.ui.appendNotice(formatCommandHelp(
+        buildSlashCommands(this.ctx.commands.list(this.agent)),
+      )),
+      stop: async () => this.interrupt(),
+      pause: async () => this.pauseAndExit(),
+      exit: async () => this.shutdownFromAction(true),
+      new: async () => this.requestSessionSwitch(),
+      resume: async argument => {
+        if (argument === '') await this.sessionNavigator.chooseSession()
+        else await this.requestSessionSwitch(argument)
+      },
+      sessions: async argument => {
+        if (argument !== '' && argument !== 'archived') throw new Error('usage: /sessions [archived]')
+        await this.sessionNavigator.chooseSession(argument === 'archived')
+      },
+      session: async argument => {
+        if (argument !== '' && argument !== String(this.agent.id)) {
+          await this.requestSessionSwitch(argument)
+          if (String(this.agent.id) !== argument) return
+        }
+        await this.chooseSessionAction()
+      },
+      workspaces: async argument => {
+        if (argument !== '') throw new Error('usage: /workspaces')
+        await this.sessionNavigator.chooseWorkspace()
+      },
+      models: async () => this.settingsController.showModels(),
+      model: async argument => this.settingsController.selectModel(argument),
+      reasoning: async argument => this.settingsController.selectReasoning(argument),
+      permission: async argument => {
+        if (argument === '') await this.settingsController.choosePermission()
+        else await this.runHarnessCommand(`/permission ${argument}`)
+      },
+      busy: async argument => this.settingsController.selectBusyEnter(argument),
+      settings: async argument => this.settingsController.chooseSettings(argument),
+      queue: async argument => {
+        if (argument === '') await this.queueController.choose()
+        else {
+          this.agent.followup(message(argument))
+          this.ui.setStatus('follow-up queued')
+        }
+      },
+      steer: async argument => {
+        if (argument === '') throw new Error('usage: /steer <prompt>')
+        this.agent.steer(message(argument))
+        this.ui.setStatus('steering queued')
+      },
+      attach: async argument => this.promptController.chooseAttachments(argument),
+      deliverables: async () => this.sessionInsights.chooseDeliverable(),
+      inspect: async () => this.sessionInsights.chooseInspectorEntry(),
+      stats: async () => this.sessionInsights.showSessionStats(),
+      activity: async () => this.sessionInsights.showActivity(),
+      export: async argument => this.sessionInsights.exportSession(argument),
+    }
+  }
+
+  private async processSubmission(raw: string): Promise<void> {
     if (this.closing || raw.trim() === '') return
     const input = parseInput(raw)
     if (input.kind === 'prompt') {
-      if (this.agent.status === 'running') {
-        if (this.busyEnter === 'steer') {
-          this.agent.steer(message(input.text))
-          this.ui.setStatus('steering queued for the next step')
+      const sessionId = await this.promptController.beginPrompt(input.text)
+      try {
+        const outgoing = await this.promptController.promptMessage(input.text)
+        if (this.agent.status === 'running') {
+          if (this.settingsController.busyEnter === 'steer') {
+            this.agent.steer(outgoing)
+            this.ui.setStatus('steering queued for the next step')
+          } else {
+            this.agent.followup(outgoing)
+            this.ui.setStatus('follow-up queued after the active turn')
+          }
         } else {
-          this.agent.followup(message(input.text))
-          this.ui.setStatus('follow-up queued after the active turn')
+          this.agent.followup(outgoing)
         }
-      } else {
-        this.agent.followup(message(input.text))
+        await this.promptController.completePrompt(sessionId)
+      } catch (error) {
+        await this.promptController.recoverPrompt(sessionId, input.text)
+        throw error
       }
       return
     }
@@ -382,75 +583,43 @@ export class DshTuiRunner {
       await this.runHarnessCommand(input.line)
       return
     }
-    switch (input.name) {
-      case 'help':
-        this.ui.appendNotice(formatCommandHelp(
-          buildSlashCommands(this.ctx.commands.list(this.agent)),
-        ))
-        return
-      case 'stop':
-        this.interrupt()
-        return
-      case 'pause':
-        await this.pauseAndExit()
-        return
-      case 'exit':
-        await this.shutdown(true)
-        return
-      case 'new':
-        await this.switchSession()
-        return
-      case 'resume':
-        if (input.argument === '') await this.chooseSession()
-        else await this.switchSession(input.argument)
-        return
-      case 'sessions':
-        await this.showSessions()
-        return
-      case 'models':
-        await this.showModels()
-        return
-      case 'model':
-        await this.selectModel(input.argument)
-        return
-      case 'reasoning':
-        await this.selectReasoning(input.argument)
-        return
-      case 'permission':
-        if (input.argument === '') await this.choosePermission()
-        else await this.runHarnessCommand(`/permission ${input.argument}`)
-        return
-      case 'busy':
-        await this.selectBusyEnter(input.argument)
-        return
-      case 'settings':
-        await this.chooseSettings(input.argument)
-        return
-      case 'queue':
-        if (input.argument === '') throw new Error('usage: /queue <prompt>')
-        this.agent.followup(message(input.argument))
-        this.ui.setStatus('follow-up queued')
-        return
-      case 'steer':
-        if (input.argument === '') throw new Error('usage: /steer <prompt>')
-        this.agent.steer(message(input.argument))
-        this.ui.setStatus('steering queued')
-        return
-    }
+    await this.localCommandHandlers()[input.name](input.argument)
   }
 
-  private async runHarnessCommand(line: string): Promise<void> {
+  private async runHarnessCommand(
+    line: string,
+    agent: Agent = this.agent,
+    generation = this.sessionGeneration,
+  ): Promise<void> {
+    if (this.commandAbort !== undefined) throw new Error('another Harness command is already running')
     const abort = new AbortController()
-    const execution = await this.ctx.commands.execute(this.agent, line, abort.signal)
-    if (execution === undefined) {
-      const available = this.ctx.commands.list(this.agent).map(command => `/${command.name}`).join(', ')
-      this.ui.appendNotice(`Unknown Harness command: ${line}\nAvailable: ${available || 'none'}`)
-      return
+    this.commandAbort = abort
+    const executionPromise = this.ctx.commands.execute(agent, line, abort.signal)
+    const settled = executionPromise.then(() => {}, () => {})
+    this.commandPromise = settled
+    try {
+      const execution = await executionPromise
+      if (execution === undefined) {
+        if (generation === this.sessionGeneration && this.handle?.agent === agent) {
+          const available = this.ctx.commands.list(agent).map(command => `/${command.name}`).join(', ')
+          this.ui.appendNotice(`Unknown Harness command: ${line}\nAvailable: ${available || 'none'}`)
+        }
+        return
+      }
+      if (generation === this.sessionGeneration && this.handle?.agent === agent) this.refresh()
+    } catch (error) {
+      if (!abort.signal.aborted) throw error
+    } finally {
+      if (this.commandAbort === abort) this.commandAbort = undefined
+      if (this.commandPromise === settled) this.commandPromise = undefined
     }
-    this.refresh()
   }
 
   interrupt(): void {
+    this.sessionNavigator.interrupt()
+    this.sessionTransitionAbort?.abort(new Error('session change cancelled'))
+    this.commandAbort?.abort(new Error('Harness command cancelled'))
+    this.sessionInsights.interrupt()
     if (this.handle === undefined) return
     if (this.agent.status === 'running') {
       this.agent.cancel({ kind: 'user' }, { keepInbox: true })
@@ -460,76 +629,281 @@ export class DshTuiRunner {
     }
   }
 
-  private async switchSession(resumeId?: string): Promise<void> {
-    this.ui.setStatus(resumeId ? `opening ${resumeId}…` : 'creating a new session…')
-    await this.detachCurrent()
-    await this.open(resumeId)
-    this.ui.appendLaunchBanner(
-      String(this.agent.id),
-      this.agent.session.header.cwd ?? resolve(this.startup.cwd ?? process.cwd()),
-    )
-    this.ui.appendNotice(resumeId ? `Resumed ${resumeId}` : `New session ${this.agent.id}`)
+  private pendingInboxCount(): number {
+    if (this.handle === undefined) return 0
+    return this.agent.inbox.nextTurn.length + this.agent.inbox.nextStep.length
+  }
+
+  private blockSessionChangeForPending(): boolean {
+    const count = this.pendingInboxCount()
+    if (count === 0) return false
+    const status = `wait for ${count} queued ${count === 1 ? 'message' : 'messages'} before changing sessions`
+    this.ui.setStatus(status)
+    this.ui.flashStatus(status)
+    return true
+  }
+
+  private async withSessionTransition(
+    operation: (signal: AbortSignal) => Promise<void>,
+  ): Promise<void> {
+    if (this.closing) throw new Error('the TUI is shutting down')
+    if (this.sessionTransitionAbort !== undefined) throw new Error('another session change is already in progress')
+    const abort = new AbortController()
+    this.sessionTransitionAbort = abort
+    const transition = (async () => {
+      try {
+        await operation(abort.signal)
+      } catch (error) {
+        if (abort.signal.aborted && this.handle !== undefined) {
+          this.ui.setStatus('session change cancelled')
+          return
+        }
+        throw error
+      } finally {
+        if (this.sessionTransitionAbort === abort) this.sessionTransitionAbort = undefined
+      }
+    })()
+    this.sessionTransitionPromise = transition
+    try {
+      await transition
+    } finally {
+      if (this.sessionTransitionPromise === transition) this.sessionTransitionPromise = undefined
+    }
+  }
+
+  private async withComposerLock(operation: () => Promise<void>): Promise<void> {
+    this.ui.setComposerLocked(true)
+    try {
+      await operation()
+    } finally {
+      this.ui.setComposerLocked(false)
+    }
+  }
+
+  private async requestSessionSwitch(resumeId?: string): Promise<void> {
+    await this.withSessionTransition(signal => this.requestSessionSwitchInner(resumeId, signal))
+  }
+
+  private async requestSessionSwitchInner(resumeId: string | undefined, signal: AbortSignal): Promise<void> {
+    if (resumeId !== undefined && resumeId === String(this.agent.id)) return
+    if (this.blockSessionChangeForPending()) return
+
+    // Resolve a direct target before the current agent is stopped. The resolved
+    // route is reused during open so there is no second, uninterruptible scan.
+    const fallback = this.ctx.agentDefaultModel.currentSelection()
+    const targetSelection = await this.resolveSessionSelection(resumeId, fallback, signal)
+
+    if (this.agent.status === 'running') {
+      const target = resumeId === undefined ? 'create a new session' : 'open the selected session'
+      const choice = await this.ui.choose(
+        `The current turn is still running. Stop it and ${target}?`,
+        [
+          { value: 'stay', label: 'Stay here', description: 'Keep the current turn running' },
+          { value: 'switch', label: 'Stop and switch', description: 'Stop this turn, save it, and change sessions' },
+        ],
+        signal,
+        { initialValue: 'stay' },
+      )
+      if (choice?.value !== 'switch') return
+    }
+
+    // A message may have been queued while the confirmation was open.
+    if (this.blockSessionChangeForPending()) return
+    if (!await this.promptController.confirmDiscardPendingImages()) return
+    await this.switchSession(resumeId, signal, targetSelection)
+  }
+
+  private async restoreAfterFailedSessionChange(
+    previousId: string,
+    previousSelection: ModelSelection | undefined,
+  ): Promise<void> {
+    if (this.closing) throw new Error('cannot restore a session while the TUI is shutting down')
+    try {
+      await this.open(previousId, previousSelection, undefined, previousSelection)
+      if (this.closing) throw new Error('session restoration was interrupted by shutdown')
+      this.ui.appendNotice(`Session change failed; restored ${previousId}`)
+    } catch (error) {
+      if (this.closing) throw error
+      await this.open(undefined, previousSelection, undefined, previousSelection)
+      if (this.closing) throw new Error('fallback session creation was interrupted by shutdown')
+      this.promptController.clearPendingImages()
+      this.ui.appendNotice('Session change failed; opened a fresh session because the previous session could not be restored.')
+    }
+    await this.promptController.restoreCurrentDraft()
     this.refresh()
+  }
+
+  private async switchSession(
+    resumeId?: string,
+    signal?: AbortSignal,
+    targetSelection?: ModelSelection,
+  ): Promise<void> {
+    if (signal === undefined) {
+      await this.withSessionTransition(async transitionSignal => {
+        const fallback = this.selection?.current ?? this.ctx.agentDefaultModel.currentSelection()
+        const selected = await this.resolveSessionSelection(resumeId, fallback, transitionSignal)
+        await this.switchSession(resumeId, transitionSignal, selected)
+      })
+      return
+    }
+    await this.withComposerLock(async () => {
+      this.ui.setStatus(resumeId ? `opening ${resumeId}…` : 'creating a new session…')
+      const previousId = String(this.agent.id)
+      const previousSelection = this.selection?.current
+      await this.promptController.persistCurrentDraft()
+      signal.throwIfAborted()
+      await this.detachCurrent()
+      try {
+        await this.open(resumeId, targetSelection, signal, targetSelection)
+        signal.throwIfAborted()
+      } catch (error) {
+        if (!this.closing) await this.restoreAfterFailedSessionChange(previousId, previousSelection)
+        throw error
+      }
+      this.promptController.clearPendingImages()
+      this.ui.appendLaunchBanner(
+        String(this.agent.id),
+        this.agent.session.header.cwd ?? resolve(this.startup.cwd ?? process.cwd()),
+      )
+      await this.promptController.restoreCurrentDraft()
+      this.ui.appendNotice(resumeId ? `Resumed ${resumeId}` : `New session ${this.agent.id}`)
+      this.refresh()
+    })
+  }
+
+  private async chooseSessionAction(): Promise<void> {
+    const action = await this.ui.choose('Current session actions', [
+      { value: 'rename', label: 'Rename…', description: 'Set a durable title for this session' },
+      { value: 'fork', label: 'Fork…', description: 'Create a new session from a completed turn' },
+      { value: 'archive', label: 'Archive…', description: 'Hide this session from normal navigation' },
+      { value: 'cancel', label: 'Cancel' },
+    ], undefined, { initialValue: 'cancel' })
+    if (action === undefined || action.value === 'cancel') return
+    if (action.value === 'rename') {
+      const current = this.ctx.sessionTitle.get(this.agent.session)?.title
+      const title = await this.ui.promptText(`New session title${current === undefined ? '' : ` (currently: ${current})`}:`)
+      if (title === undefined) return
+      const renamed = this.ctx.sessionTitle.rename(this.agent.session, title)
+      await this.ctx.sessions.flush(this.agent.session)
+      this.sessionNavigator.invalidate(String(this.agent.id))
+      this.ui.appendNotice(`Renamed this session to ${renamed.title}.`)
+      return
+    }
+    if (action.value === 'fork') {
+      await this.chooseForkBoundary()
+      return
+    }
+    await this.archiveCurrentSession()
+  }
+
+  private async chooseForkBoundary(): Promise<void> {
+    if (this.blockSessionChangeForPending()) return
+    if (this.agent.status === 'running') {
+      this.ui.flashStatus('Stop the active turn before creating a fork.')
+      return
+    }
+    if (!await this.promptController.confirmDiscardPendingImages()) return
+    const endings = this.agent.session.events.filter(event => event.type === 'turn/end')
+    const choices = endings.length === 0
+      ? [{ value: '-1', label: 'Empty fork', description: 'Start with no prior turns' }]
+      : endings.map(event => ({
+          value: String(event.seq),
+          label: `After turn ${event.data.turn}`,
+          description: `${event.data.reason} · ${new Date(event.time).toLocaleString()} · seq ${event.seq}`,
+    })).reverse()
+    const choice = await this.ui.choose('Fork boundary', choices, undefined, { initialValue: choices[0]?.value })
+    if (choice === undefined) return
+    await this.withSessionTransition(signal => this.forkCurrentSession(Number(choice.value), signal))
+  }
+
+  private async forkCurrentSession(boundary: number, signal?: AbortSignal): Promise<void> {
+    if (signal === undefined) {
+      await this.withSessionTransition(transitionSignal => this.forkCurrentSession(boundary, transitionSignal))
+      return
+    }
+    await this.withComposerLock(async () => {
+      const source = this.agent.session
+      const previousId = String(source.id)
+      const previousSelection = this.selection?.current
+      if (previousSelection === undefined) throw new Error('model selection is unavailable')
+      const seed = forkSeedEvents(source.events, boundary)
+      const childId = SessionId(`session-${randomUUID()}`)
+      const selection: ModelSelectionRef = { current: { ...previousSelection }, assembled: undefined }
+      await this.promptController.persistCurrentDraft()
+      signal.throwIfAborted()
+      await this.detachCurrent()
+      try {
+        const contextWindow = await this.resolveContextWindow(previousSelection, signal)
+        signal.throwIfAborted()
+        const handle = await this.ctx.agents.create({
+          sessionId: childId,
+          meta: {
+            ...(source.header.cwd === undefined ? {} : { cwd: source.header.cwd }),
+            parentSession: source.id,
+            seedLength: seed.length,
+          },
+          seed,
+          agentOptions: { provider: previousSelection.provider, model: previousSelection.model },
+          setup: (agentCtx: Context): void => { installModelSelection(agentCtx, selection) },
+          signal,
+        })
+        if (signal.aborted) {
+          await handle.dispose()
+          signal.throwIfAborted()
+        }
+        this.activateSession({ handle, selection, contextWindow })
+        await this.attachCurrentWorkspace()
+        signal.throwIfAborted()
+        this.promptController.clearPendingImages()
+      } catch (error) {
+        if (!this.closing) await this.restoreAfterFailedSessionChange(previousId, previousSelection)
+        throw error
+      }
+      this.ui.appendLaunchBanner(
+        String(this.agent.id),
+        this.agent.session.header.cwd ?? resolve(this.startup.cwd ?? process.cwd()),
+      )
+      await this.promptController.restoreCurrentDraft()
+      this.ui.appendNotice(`Forked ${previousId} into ${this.agent.id} at ${boundary < 0 ? 'an empty history' : `seq ${boundary}`}.`)
+      this.refresh()
+    })
+  }
+
+  private async archiveCurrentSession(): Promise<void> {
+    const archivedId = String(this.agent.id)
+    const confirmation = await this.ui.choose(
+      `Archive ${archivedId}?\n\nThe session log will be preserved, but Harness rc.6 cannot unarchive it.`,
+      [
+        { value: 'cancel', label: 'Cancel', description: 'Keep the session in normal navigation' },
+        { value: 'archive', label: 'Archive session', description: 'Hide it from normal session and workspace lists' },
+      ],
+      undefined,
+      { initialValue: 'cancel' },
+    )
+    if (confirmation?.value !== 'archive') return
+    await this.requestSessionSwitch()
+    if (String(this.agent.id) === archivedId) return
+    await this.ctx.workspaceRegistry.archiveSession(SessionId(archivedId))
+    this.sessionNavigator.invalidate(archivedId)
+    this.ui.appendNotice(`Archived ${archivedId}. Its durable session log was preserved.`)
   }
 
   private async detachCurrent(): Promise<void> {
     if (this.handle === undefined) return
-    this.agent.cancel({ kind: 'user' }, { keepInbox: true })
-    await this.agent.whenIdle()
-    await this.ctx.sessions.flush(this.agent.session)
-    while (this.subscriptions.length > 0) this.subscriptions.pop()?.()
     const handle = this.handle
+    const agent = handle.agent
+    this.sessionGeneration += 1
+    agent.cancel({ kind: 'user' }, { keepInbox: true })
+    await agent.whenIdle()
+    await this.ctx.sessions.flush(agent.session)
+    await handle.dispose()
+    if (this.handle !== handle) return
+    while (this.subscriptions.length > 0) this.subscriptions.pop()?.()
     this.handle = undefined
     this.selection = undefined
     this.projection = undefined
     this.projectionCursor = 0
-    await handle.dispose()
-  }
-
-  private async showSessions(): Promise<void> {
-    const sessions = await this.ctx.sessionPersistence.list()
-    sessions.sort((left, right) => right.createdAt - left.createdAt)
-    const lines = sessions.slice(0, 30).map(header =>
-      `- ${header.id} · ${new Date(header.createdAt).toLocaleString()}${header.cwd ? ` · ${header.cwd}` : ''}`)
-    this.ui.appendNotice(`Persisted sessions (${sessions.length})\n${lines.join('\n') || 'None yet.'}`)
-  }
-
-  private async chooseSession(): Promise<void> {
-    const items = await this.loadSessionPickerItems()
-    if (items.length === 0) {
-      this.ui.appendNotice('No other persisted sessions are available.')
-      return
-    }
-    const choice = await this.ui.choose('Resume a persisted session', items)
-    if (choice !== undefined) await this.switchSession(choice.value)
-  }
-
-  private async loadSessionPickerItems(): Promise<PickerItem[]> {
-    const sessions = await this.ctx.sessionPersistence.list()
-    return sessionPickerItems(sessions.map(header => ({
-      id: String(header.id),
-      cwd: header.cwd,
-      createdAt: header.createdAt,
-    }))).filter(item => item.value !== String(this.agent.id)).slice(0, 30)
-  }
-
-  private permissionPickerItems(): PickerItem[] {
-    const current = this.ctx.permissionPresets.current(this.agent.session.events)
-    return this.ctx.permissionPresets.names.map(name => {
-      const option = this.ctx.permissionPresets.optionOf(name)
-      return {
-        value: option.value,
-        label: option.name,
-        description: `${name === current ? 'Current · ' : ''}${option.description ?? name}`,
-      }
-    })
-  }
-
-  private async choosePermission(): Promise<void> {
-    const choice = await this.ui.choose('Choose a permission mode', this.permissionPickerItems(), undefined, {
-      initialValue: this.ctx.permissionPresets.current(this.agent.session.events),
-    })
-    if (choice !== undefined) await this.runHarnessCommand(`/permission ${choice.value}`)
+    this.selectedContextWindow = undefined
   }
 
   private async chooseGoalCommand(): Promise<void> {
@@ -564,297 +938,6 @@ export class DshTuiRunner {
     await this.runHarnessCommand(choice.value === 'off' ? '/plan off' : '/plan')
   }
 
-  private async loadModels(): Promise<ModelPickerSource[]> {
-    const available: ModelPickerSource[] = []
-    for (const provider of this.ctx.llm.listProviders()) {
-      try {
-        const models = await this.ctx.llm.listModels(provider.id)
-        for (const model of models) {
-          available.push({ provider: provider.id, model: model.id, name: model.name })
-        }
-      } catch {
-        // A provider that cannot enumerate models stays out of the picker.
-      }
-    }
-    return available
-  }
-
-  private async showModels(): Promise<void> {
-    const lines: string[] = []
-    for (const provider of this.ctx.llm.listProviders()) {
-      try {
-        const models = await this.ctx.llm.listModels(provider.id)
-        if (models.length === 0) lines.push(`- ${provider.id} · no advertised models`)
-        else for (const model of models) lines.push(`- ${provider.id}/${model.id} · ${model.name}`)
-      } catch (error: unknown) {
-        lines.push(`- ${provider.id} · ${error instanceof Error ? error.message : String(error)}`)
-      }
-    }
-    this.ui.appendNotice(`Available models\n${lines.join('\n') || 'No active providers.'}`)
-  }
-
-  private async selectModel(value: string): Promise<void> {
-    const interactive = value.trim() === ''
-    if (interactive) {
-      const items = modelPickerItems(await this.loadModels())
-      if (items.length === 0) {
-        this.ui.appendNotice('No models are currently available.')
-        return
-      }
-      const current = this.selection?.current
-      const choice = await this.ui.choose('Choose a model', items, undefined, {
-        initialValue: current === undefined ? undefined : `${current.provider}/${current.model}`,
-      })
-      if (choice === undefined) return
-      value = choice.value
-    }
-    const ref = parseModelRef(value)
-    if (ref === undefined) throw new Error('usage: /model <provider>/<model>')
-    const info = await this.ctx.llm.resolveModelInfo(ref.provider, ref.model)
-    if (this.selection === undefined) throw new Error('model selection is unavailable')
-    let next: ModelSelection = ref
-    if (interactive && info.reasoning !== undefined) {
-      const reasoning = await this.ui.choose(
-        'Choose reasoning effort',
-        reasoningPickerItems(info.reasoning),
-        undefined,
-        { initialValue: reasoningInitialValue(this.selection.current, ref) },
-      )
-      if (reasoning === undefined) return
-      next = {
-        ...ref,
-        ...(reasoning.value === 'default' ? {} : { reasoningEffort: ReasoningEffortId(reasoning.value) }),
-      }
-    }
-    this.selection.current = next
-    this.ui.appendNotice(
-      `Next request will use ${ref.provider}/${ref.model} · reasoning ${next.reasoningEffort ?? 'model default'}`,
-    )
-    this.refresh()
-  }
-
-  private async loadReasoningPickerItems(): Promise<PickerItem[]> {
-    const selection = this.selection?.current
-    if (selection === undefined) return []
-    const info = await this.ctx.llm.resolveModelInfo(selection.provider, selection.model)
-    return info.reasoning === undefined ? [] : reasoningPickerItems(info.reasoning)
-  }
-
-  private async chooseReasoning(): Promise<void> {
-    const items = await this.loadReasoningPickerItems()
-    if (items.length === 0) {
-      this.ui.appendNotice('The current model does not expose configurable reasoning effort.')
-      return
-    }
-    const choice = await this.ui.choose('Choose reasoning effort', items, undefined, {
-      initialValue: this.selection?.current?.reasoningEffort ?? 'default',
-    })
-    if (choice !== undefined) await this.selectReasoning(choice.value)
-  }
-
-  private async selectReasoning(value: string): Promise<void> {
-    if (value.trim() === '') {
-      await this.chooseReasoning()
-      return
-    }
-    const selection = this.selection?.current
-    if (selection === undefined) throw new Error('model selection is unavailable')
-    const info = await this.ctx.llm.resolveModelInfo(selection.provider, selection.model)
-    if (info.reasoning === undefined) throw new Error('current model does not support reasoning effort selection')
-    const normalized = value.trim()
-    if (normalized !== 'default' && !info.reasoning.efforts.some(effort => effort.id === normalized)) {
-      throw new Error(`unknown reasoning effort: ${normalized}`)
-    }
-    this.selection!.current = {
-      provider: selection.provider,
-      model: selection.model,
-      ...(normalized === 'default' ? {} : { reasoningEffort: ReasoningEffortId(normalized) }),
-    }
-    this.ui.appendNotice(normalized === 'default'
-      ? 'Reasoning effort reset to the model default.'
-      : `Reasoning effort set to ${normalized}.`)
-    this.refresh()
-  }
-
-  private async selectBusyEnter(value: string): Promise<void> {
-    if (value.trim() === '') {
-      const choice = await this.ui.choose('Plain Enter while the agent is busy', [...BUSY_PICKER_ITEMS], undefined, {
-        initialValue: this.busyEnter,
-      })
-      if (choice === undefined) return
-      value = choice.value
-    }
-    if (value !== 'queue' && value !== 'steer') throw new Error('usage: /busy <queue|steer>')
-    this.busyEnter = value
-    this.ui.appendNotice(`Busy Enter now ${value === 'queue' ? 'queues a follow-up' : 'steers the active turn'}.`)
-  }
-
-  private settingsSummary(): string {
-    const current = this.selection?.current
-    const model = current === undefined ? 'unavailable' : `${current.provider}/${current.model}`
-    const currentPermission = this.ctx.permissionPresets.current(this.agent.session.events)
-    const defaults = this.ctx.agentDefaultModel.currentSelection()
-    return [
-      'Core TUI settings',
-      `- Current model: ${model}`,
-      `- Current reasoning: ${current?.reasoningEffort ?? 'model default'}`,
-      `- Current permission: ${currentPermission}`,
-      `- Busy Enter: ${this.busyEnter}`,
-      `- Transcript detail: ${this.transcriptDensity}`,
-      `- New-session model: ${defaults.provider}/${defaults.model}`,
-      `- New-session reasoning: ${defaults.reasoningEffort ?? 'model default'}`,
-      `- New-session permission: ${this.ctx.permissionPresets.defaultPreset}`,
-      `- Working directory: ${this.agent.session.header.cwd ?? resolve(this.startup.cwd ?? process.cwd())}`,
-    ].join('\n')
-  }
-
-  private loadSettingsNamespacePickerItems(): PickerItem[] {
-    return settingsNamespacePickerItems(this.ctx.settings.describe({ redactSecrets: true }).map(descriptor => ({
-      ns: String(descriptor.ns),
-      applies: descriptor.applies,
-      revision: descriptor.revision,
-      secrets: descriptor.secrets,
-    })))
-  }
-
-  private async editAdvancedSettings(namespace = ''): Promise<void> {
-    const descriptors = this.ctx.settings.describe({ redactSecrets: true })
-    if (descriptors.length === 0) {
-      this.ui.appendNotice('No runtime settings namespaces are registered.')
-      return
-    }
-    if (namespace.trim() === '') {
-      const choice = await this.ui.choose(
-        'Advanced runtime settings',
-        settingsNamespacePickerItems(descriptors.map(descriptor => ({
-          ns: String(descriptor.ns),
-          applies: descriptor.applies,
-          revision: descriptor.revision,
-          secrets: descriptor.secrets,
-        }))),
-      )
-      if (choice === undefined) return
-      namespace = choice.value
-    }
-    const descriptor = descriptors.find(candidate => String(candidate.ns) === namespace.trim())
-    if (descriptor === undefined) throw new Error(`unknown settings namespace: ${namespace}`)
-    const redacted = JSON.stringify(descriptor.value, null, 2) ?? 'undefined'
-    this.ui.appendNotice([
-      `Settings: ${descriptor.ns}`,
-      `Applies: ${descriptor.applies}`,
-      `Revision: ${descriptor.revision}`,
-      descriptor.secrets?.length ? 'Secret fields are hidden and will not be changed by a patch.' : undefined,
-      '',
-      redacted,
-    ].filter((line): line is string => line !== undefined).join('\n'))
-    const action = await this.ui.choose(`Edit ${descriptor.ns}`, [
-      { value: 'patch', label: 'Apply JSON patch…', description: 'Merge fields into this namespace' },
-      { value: 'reset', label: 'Reset overrides', description: 'Return every field to its composed/default value' },
-      { value: 'cancel', label: 'Cancel' },
-    ])
-    if (action === undefined || action.value === 'cancel') return
-    if (action.value === 'reset') {
-      const confirmation = await this.ui.choose(`Reset all user overrides for ${descriptor.ns}?`, [
-        { value: 'cancel', label: 'Cancel' },
-        { value: 'confirm', label: 'Reset overrides', description: 'Re-inherit composition defaults' },
-      ])
-      if (confirmation?.value !== 'confirm') return
-      await this.ctx.settings.replace(descriptor.ns, {}, descriptor.revision)
-      this.ui.appendNotice(`Reset ${descriptor.ns}. ${descriptor.applies === 'restart' ? 'Restart the TUI to apply it.' : 'Applied live.'}`)
-      return
-    }
-    const text = await this.ui.promptText(`JSON object patch for ${descriptor.ns}:`)
-    if (text === undefined) return
-    await this.ctx.settings.update(descriptor.ns, parseSettingsPatch(text), descriptor.revision)
-    this.ui.appendNotice(`Updated ${descriptor.ns}. ${descriptor.applies === 'restart' ? 'Restart the TUI to apply it.' : 'Applied live.'}`)
-  }
-
-  private settingsChoices() {
-    const current = this.selection?.current
-    const defaults = this.ctx.agentDefaultModel.currentSelection()
-    const permission = this.ctx.permissionPresets.current(this.agent.session.events)
-    const values: Record<string, string> = {
-      summary: 'view',
-      model: current === undefined ? 'unavailable' : `${current.provider}/${current.model}`,
-      reasoning: current?.reasoningEffort ?? 'model default',
-      permission,
-      busy: this.busyEnter,
-      'transcript-density': this.transcriptDensity,
-      'save-model-default': `${defaults.provider}/${defaults.model}`,
-      'save-permission-default': this.ctx.permissionPresets.defaultPreset,
-      advanced: `${this.ctx.settings.describe({ redactSecrets: true }).length} namespaces`,
-    }
-    return SETTINGS_PICKER_ITEMS.map(item => ({
-      id: item.value,
-      label: item.label,
-      description: item.description,
-      currentValue: values[item.value] ?? '',
-    }))
-  }
-
-  private async chooseSettings(action = ''): Promise<void> {
-    if (action.trim() !== '') {
-      await this.applySetting(action.trim())
-      return
-    }
-    let selectedId: string | undefined
-    while (!this.closing) {
-      const choice = await this.ui.chooseSetting('Core settings', this.settingsChoices(), undefined, selectedId)
-      if (choice === undefined) return
-      selectedId = choice
-      await this.applySetting(choice)
-    }
-  }
-
-  private async applySetting(action: string): Promise<void> {
-    switch (action.trim()) {
-      case 'summary': this.ui.appendNotice(this.settingsSummary()); return
-      case 'model': await this.selectModel(''); return
-      case 'reasoning': await this.selectReasoning(''); return
-      case 'permission': await this.choosePermission(); return
-      case 'busy': await this.selectBusyEnter(''); return
-      case 'transcript-density': await this.selectTranscriptDensity(); return
-      case 'advanced': await this.editAdvancedSettings(); return
-      case 'save-model-default': {
-        const current = this.selection?.current
-        if (current === undefined) throw new Error('model selection is unavailable')
-        await this.ctx.agentDefaultModel.saveSelection(current)
-        this.ui.appendNotice(`Saved ${current.provider}/${current.model} as the default for future sessions.`)
-        return
-      }
-      case 'save-permission-default': {
-        const current = this.ctx.permissionPresets.current(this.agent.session.events)
-        if (current === 'custom') throw new Error('custom permission state cannot be saved as a preset default')
-        if (current === 'danger-full-access') {
-          const confirmed = await this.ui.choose('Save Full access as the default for future sessions?', [
-            { value: 'cancel', label: 'Cancel', description: 'Keep the safer existing default' },
-            { value: 'confirm', label: 'Save Full access', description: 'New sessions may run tools without approval' },
-          ])
-          if (confirmed?.value !== 'confirm') return
-        }
-        await this.ctx.settings.update(PERMISSION_SETTINGS_NAMESPACE, { defaultPreset: current })
-        this.ui.appendNotice(`Saved ${current} as the permission default for future sessions.`)
-        return
-      }
-      default: await this.editAdvancedSettings(action); return
-    }
-  }
-
-  private async selectTranscriptDensity(): Promise<void> {
-    const choice = await this.ui.choose('Transcript detail', [...TRANSCRIPT_DENSITY_PICKER_ITEMS], undefined, {
-      initialValue: this.transcriptDensity,
-    })
-    if (choice === undefined) return
-    const density = choice.value as TranscriptDensity
-    if (this.transcriptSettings === undefined) {
-      this.localTranscriptDensity = density
-      this.ui.setTranscriptDensity(density)
-    } else {
-      await this.transcriptSettings.update({ transcriptDensity: density })
-    }
-    this.ui.appendNotice(`Transcript detail set to ${choice.label}.`)
-  }
-
   private async pauseAndExit(): Promise<void> {
     if (this.handle === undefined) return
     const id = sanitizeTerminalText(String(this.agent.id))
@@ -863,19 +946,50 @@ export class DshTuiRunner {
     await this.ctx.sessions.flush(this.agent.session)
     this.ui.stop()
     process.stdout.write(`Paused DeepSeek session ${id}\nResume with: deepseek --resume ${id}\n`)
-    await this.shutdown(true, false)
+    await this.shutdownFromAction(true, false)
   }
 
-  async shutdown(requestExit: boolean, stopUi = true): Promise<void> {
-    if (this.closing) return
+  shutdown(requestExit: boolean, stopUi = true): Promise<void> {
+    return this.beginShutdown(requestExit, stopUi, this.actionQueue)
+  }
+
+  private shutdownFromAction(requestExit: boolean, stopUi = true): Promise<void> {
+    if (this.shutdownPromise !== undefined) return Promise.resolve()
+    return this.beginShutdown(requestExit, stopUi)
+  }
+
+  private beginShutdown(
+    requestExit: boolean,
+    stopUi: boolean,
+    inFlightActions?: Promise<void>,
+  ): Promise<void> {
+    if (this.shutdownPromise !== undefined) return this.shutdownPromise
     this.closing = true
-    try {
-      if (stopUi && this.started) this.ui.stop()
-      await this.detachCurrent()
-    } finally {
-      while (this.interactionDisposers.length > 0) this.interactionDisposers.pop()?.()
-      if (requestExit) this.ctx.get('appExit')?.(0)
-    }
+    this.startupAbort.abort(new Error('TUI shutting down'))
+    this.sessionNavigator.interrupt(new Error('TUI shutting down'))
+    this.sessionTransitionAbort?.abort(new Error('TUI shutting down'))
+    this.commandAbort?.abort(new Error('TUI shutting down'))
+    this.sessionInsights.shutdown()
+    const inFlightStartup = this.started ? undefined : this.startPromise
+    const inFlightTransition = this.sessionTransitionPromise
+    const inFlightCommand = this.commandPromise
+    this.shutdownPromise = (async () => {
+      try {
+        if (stopUi && this.started) this.ui.stop()
+        await inFlightStartup?.catch(() => {})
+        await inFlightActions
+        await inFlightTransition?.catch(() => {})
+        await inFlightCommand
+        this.settingsController.dispose()
+        await this.promptController.persistCurrentDraft()
+        await this.promptController.flushDrafts()
+        await this.detachCurrent()
+      } finally {
+        this.promptController.disposeInteractions()
+        if (requestExit) this.ctx.get('appExit')?.(0)
+      }
+    })()
+    return this.shutdownPromise
   }
 }
 

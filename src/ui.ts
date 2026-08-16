@@ -2,6 +2,7 @@ import {
   CombinedAutocompleteProvider,
   Container,
   Editor,
+  Input,
   Key,
   Markdown,
   ProcessTerminal,
@@ -11,12 +12,15 @@ import {
   Text,
   TuiAltScreen,
   VStack,
+  fuzzyFilter,
+  isKeyRelease,
   matchesKey,
   truncateToWidth,
   visibleWidth,
   type Component,
   type AutocompleteProvider,
   type EditorTheme,
+  type Focusable,
   type MarkdownTheme,
   type SelectItem,
   type SelectListTheme,
@@ -38,7 +42,10 @@ const yellow = ansi('33')
 const red = ansi('31')
 const green = ansi('32')
 const magenta = ansi('35')
-const BANNER_CONTROLS = '/ commands · @ files · F2 settings · Ctrl+C stop / ×2 exit · Ctrl+D exit · /help'
+const BANNER_CONTROLS = [
+  '/ commands · @ files · F2 settings · Ctrl+C stop / ×2 exit · Ctrl+D exit · /help',
+  'Shift+Tab plan/build · Shift+↑/↓ reasoning',
+].join('\n')
 const SUMMARY_MAX_CHARS = 120
 const NORMAL_REASONING_LINES = 3
 const NORMAL_REASONING_CHARS = 600
@@ -483,6 +490,28 @@ class TranscriptRow implements Component {
   }
 }
 
+function formatScaledTokens(value: number): string {
+  return value >= 100 ? String(Math.round(value)) : String(Math.round(value * 10) / 10)
+}
+
+function formatTokens(value: number): string {
+  if (value < 1_000) return String(value)
+  if (value < 1_000_000) return `${formatScaledTokens(value / 1_000)}K`
+  return `${formatScaledTokens(value / 1_000_000)}M`
+}
+
+function formatContextWindow(
+  context: NonNullable<ProjectionState['contextWindow']>,
+  compact: boolean,
+): string {
+  const capacity = formatTokens(context.capacityTokens)
+  const used = context.usedTokens === undefined ? '—' : `~${formatTokens(context.usedTokens)}`
+  if (compact) return `c:${used}/${capacity}`
+  if (context.usedTokens === undefined) return `ctx ${used}/${capacity}`
+  const percent = Math.min(100, Math.round(context.usedTokens / context.capacityTokens * 100))
+  return `ctx ${used}/${capacity} (${String(percent)}%)`
+}
+
 export class StatusLine implements Component {
   private state?: ProjectionState
   private note = ''
@@ -532,7 +561,11 @@ export class StatusLine implements Component {
     const scroll = followingOutput
       ? undefined
       : yellow(compactPrimary ? 'End↑' : 'history ↑ · End to latest')
-    const fixedPrimary = [activity, reasoning, mode, permission, ...(scroll === undefined ? [] : [scroll])]
+    const contextWindow = state.contextWindow
+    const context = contextWindow === undefined || width < 55
+      ? undefined
+      : deepseekBlue(formatContextWindow(contextWindow, compactPrimary))
+    const fixedPrimary = [activity, reasoning, mode, permission, ...(context === undefined ? [] : [context]), ...(scroll === undefined ? [] : [scroll])]
     const modelBudget = Math.max(
       3,
       width - fixedPrimary.reduce((total, segment) => total + visibleWidth(segment), 0)
@@ -545,7 +578,7 @@ export class StatusLine implements Component {
       : 'model unavailable'
     const modelText = truncateToWidth(rawModel, modelBudget, '…')
     const model = state.provider && state.model ? deepseekBlue(modelText) : dim(modelText)
-    const primary = [model, reasoning, mode, permission, activity, ...(scroll === undefined ? [] : [scroll])]
+    const primary = [model, reasoning, mode, permission, ...(context === undefined ? [] : [context]), activity, ...(scroll === undefined ? [] : [scroll])]
     let output = primary.join(separator)
 
     const tools = state.activeTools.length > 0
@@ -563,7 +596,7 @@ export class StatusLine implements Component {
     const note = this.note === '' || this.note === 'ready'
       ? undefined
       : this.note.startsWith('error:') ? red(this.note) : dim(this.note)
-    for (const segment of [tools, retry, session, usage, goal, todos, note]) {
+    for (const segment of [tools, retry, usage, session, goal, todos, note]) {
       if (segment === undefined) continue
       const candidate = `${output}${separator}${segment}`
       if (visibleWidth(candidate) <= width) output = candidate
@@ -583,6 +616,14 @@ const settingsTheme: SettingsListTheme = {
 export interface ChooseOptions {
   initialValue?: string
   priority?: 'optional' | 'required'
+}
+
+export interface SearchableSelectItem extends SelectItem {
+  searchText?: string
+}
+
+export interface SearchableChooseOptions extends ChooseOptions {
+  emptyText?: string
 }
 
 export interface SettingsChoice {
@@ -653,6 +694,78 @@ class CheckboxList implements Component {
   }
 }
 
+class SearchableSelectList implements Component, Focusable {
+  private readonly input = new Input()
+  private list: SelectList
+  private filteredItems: SearchableSelectItem[]
+  private isFocused = false
+  onSelect?: (item: SearchableSelectItem) => void
+  onCancel?: () => void
+
+  constructor(
+    private readonly items: SearchableSelectItem[],
+    private readonly maxVisible: number,
+    private readonly emptyText: string,
+    private readonly initialValue?: string,
+  ) {
+    this.filteredItems = items
+    this.list = this.createList()
+  }
+
+  get focused(): boolean {
+    return this.isFocused
+  }
+
+  set focused(value: boolean) {
+    this.isFocused = value
+    this.input.focused = value
+  }
+
+  invalidate(): void {
+    this.input.invalidate()
+    this.list.invalidate()
+  }
+
+  render(width: number): string[] {
+    const query = this.input.render(Math.max(1, width - 8))[0] ?? ''
+    const rows = this.filteredItems.length === 0
+      ? [dim(`  ${this.emptyText}`)]
+      : this.list.render(width)
+    return [`${dim('Search: ')}${query}`, '', ...rows]
+  }
+
+  handleInput(data: string): void {
+    if (matchesKey(data, Key.escape)) {
+      this.onCancel?.()
+      return
+    }
+    if (matchesKey(data, Key.enter)) {
+      const selected = this.list.getSelectedItem()
+      if (selected !== null) this.onSelect?.(selected)
+      return
+    }
+    if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
+      this.list.handleInput(data)
+      return
+    }
+    this.input.handleInput(data)
+    this.filteredItems = fuzzyFilter(this.items, this.input.getValue(), item =>
+      item.searchText ?? `${item.label} ${item.value} ${item.description ?? ''}`)
+    this.list = this.createList()
+  }
+
+  private createList(): SelectList {
+    const list = new SelectList(this.filteredItems, this.maxVisible, selectTheme)
+    if (this.input.getValue() === '' && this.initialValue !== undefined) {
+      const initialIndex = this.filteredItems.findIndex(item => item.value === this.initialValue)
+      if (initialIndex >= 0) list.setSelectedIndex(initialIndex)
+    }
+    list.onSelect = item => this.onSelect?.(item)
+    list.onCancel = () => this.onCancel?.()
+    return list
+  }
+}
+
 interface PendingText {
   resolve(value: string): void
   reject(error: Error): void
@@ -661,7 +774,11 @@ interface PendingText {
 
 export interface TuiCallbacks {
   onPrompt(text: string): void | Promise<void>
+  onDraftChange?(text: string): void | Promise<void>
+  onPasteImage?(): void | Promise<void>
   onSettings(): void | Promise<void>
+  onTogglePlanMode?(): void | Promise<void>
+  onReasoningStep?(direction: 'increase' | 'decrease'): void | Promise<void>
   onInterrupt(): void | Promise<void>
   onExit(): void | Promise<void>
 }
@@ -685,6 +802,7 @@ export class DeepSeekTui {
   private autocomplete?: AutocompleteProvider
   private readonly ctrlCExit = new CtrlCExitGate()
   private started = false
+  private composerLocked = false
 
   constructor(terminal: Terminal = new ProcessTerminal()) {
     this.tui = new TuiAltScreen(terminal, false, undefined, { mouse: true })
@@ -716,6 +834,25 @@ export class DeepSeekTui {
     if (this.pendingText === undefined) this.editor.setAutocompleteProvider(this.autocomplete)
   }
 
+  getComposerText(): string {
+    return this.editor.getExpandedText()
+  }
+
+  setComposerText(text: string): void {
+    if (this.pendingText !== undefined) throw new Error('cannot replace the composer during a text prompt')
+    this.editor.setText(text)
+    this.tui.requestRender()
+  }
+
+  setComposerLocked(locked: boolean): void {
+    this.composerLocked = locked
+  }
+
+  copyToClipboard(text: string): void {
+    this.tui.terminal.write(`\u001b]52;c;${Buffer.from(text, 'utf8').toString('base64')}\u0007`)
+    this.tui.flash('Copied to clipboard.', 1500)
+  }
+
   setTranscriptDensity(density: TranscriptDensity): void {
     if (density === this.transcriptDensity) return
     this.transcriptDensity = density
@@ -731,30 +868,28 @@ export class DeepSeekTui {
     if (this.started) return
     this.started = true
     this.callbacks = callbacks
+    this.editor.onChange = () => {
+      if (this.composerLocked || this.pendingText !== undefined || callbacks.onDraftChange === undefined) return
+      void Promise.resolve(callbacks.onDraftChange(this.editor.getExpandedText())).catch(error => this.flashError(error))
+    }
     this.editor.onSubmit = (text) => {
       if (text.trim() === '') return
       this.ctrlCExit.reset()
       if (this.pendingText !== undefined) {
         const pending = this.pendingText
-        this.pendingText = undefined
         pending.resolve(text)
         this.status.setNote('ready')
         this.tui.requestRender()
+        return
+      }
+      if (this.composerLocked) {
+        this.tui.flash('Finish changing sessions before sending another message.', 2500)
         return
       }
       this.editor.addToHistory(text)
       void Promise.resolve(callbacks.onPrompt(text)).catch(error => this.flashError(error))
     }
     this.tui.addInputListener((data) => {
-      if (isSettingsShortcut(data)) {
-        this.ctrlCExit.reset()
-        if (this.activeInteraction === undefined) {
-          void Promise.resolve(callbacks.onSettings()).catch(error => this.flashError(error))
-        } else {
-          this.tui.flash('Finish the current dialog before opening Settings.', 2500)
-        }
-        return { consume: true }
-      }
       if (matchesKey(data, Key.ctrl('c'))) {
         if (this.ctrlCExit.press() === 'exit') {
           void Promise.resolve(callbacks.onExit()).catch(error => this.flashError(error))
@@ -763,6 +898,56 @@ export class DeepSeekTui {
         this.activeInteraction?.cancel()
         void Promise.resolve(callbacks.onInterrupt()).catch(error => this.flashError(error))
         this.setStatus('Ctrl+C again to exit')
+        return { consume: true }
+      }
+      if (this.composerLocked) {
+        if (!isKeyRelease(data)) this.tui.flash('Changing sessions… Press Ctrl+C to cancel.', 1500)
+        return { consume: true }
+      }
+      if (matchesKey(data, Key.ctrl('v')) && callbacks.onPasteImage !== undefined) {
+        if (isKeyRelease(data)) return { consume: true }
+        this.ctrlCExit.reset()
+        if (this.activeInteraction !== undefined) {
+          this.tui.flash('Finish the current dialog before attaching an image.', 2500)
+        } else {
+          void Promise.resolve(callbacks.onPasteImage()).catch(error => this.flashError(error))
+        }
+        return { consume: true }
+      }
+      const togglePlan = matchesKey(data, Key.shift(Key.tab))
+      let reasoningDirection: 'increase' | 'decrease' | undefined
+      if (matchesKey(data, Key.shift(Key.up))) reasoningDirection = 'increase'
+      else if (matchesKey(data, Key.shift(Key.down))) reasoningDirection = 'decrease'
+      if (togglePlan || reasoningDirection !== undefined) {
+        if (isKeyRelease(data)) return { consume: true }
+        this.ctrlCExit.reset()
+        if (this.activeInteraction !== undefined) {
+          this.tui.flash('Finish the current dialog before changing mode or reasoning.', 2500)
+          return { consume: true }
+        }
+        this.editor.handleInput('\u001b')
+        let shortcut: (() => void | Promise<void>) | undefined
+        if (togglePlan) {
+          shortcut = callbacks.onTogglePlanMode
+        } else if (callbacks.onReasoningStep !== undefined && reasoningDirection !== undefined) {
+          const direction = reasoningDirection
+          const onReasoningStep = callbacks.onReasoningStep
+          shortcut = () => onReasoningStep(direction)
+        }
+        if (shortcut === undefined) {
+          this.tui.flash('This shortcut is unavailable in the current profile.', 2500)
+        } else {
+          void Promise.resolve(shortcut()).catch(error => this.flashError(error))
+        }
+        return { consume: true }
+      }
+      if (isSettingsShortcut(data)) {
+        this.ctrlCExit.reset()
+        if (this.activeInteraction === undefined) {
+          void Promise.resolve(callbacks.onSettings()).catch(error => this.flashError(error))
+        } else {
+          this.tui.flash('Finish the current dialog before opening Settings.', 2500)
+        }
         return { consume: true }
       }
       if (matchesKey(data, Key.escape) && this.pendingText !== undefined) {
@@ -843,6 +1028,10 @@ export class DeepSeekTui {
     this.tui.requestRender()
   }
 
+  flashStatus(note: string, durationMs = 2500): void {
+    this.tui.flash(sanitizeTerminalText(note), durationMs)
+  }
+
   flashError(error: unknown): void {
     const text = sanitizeTerminalText(error instanceof Error ? error.message : String(error))
     this.tui.flash(`Error: ${text}`, 5000)
@@ -885,6 +1074,51 @@ export class DeepSeekTui {
         cancel: () => settle(undefined),
       }
       this.openInteraction(title, list, '↑↓ move · Enter select · Esc close', interaction)
+      signal?.addEventListener('abort', abort, { once: true })
+    })
+  }
+
+  async chooseSearchable(
+    title: string,
+    items: SearchableSelectItem[],
+    signal?: AbortSignal,
+    options: SearchableChooseOptions = {},
+  ): Promise<SearchableSelectItem | undefined> {
+    if (signal?.aborted) return undefined
+    return await new Promise<SearchableSelectItem | undefined>((resolve) => {
+      const safeItems = items.map(item => ({
+        ...item,
+        label: `${item.value === options.initialValue ? '✓ ' : '  '}${sanitizeTerminalText(item.label)}`,
+        ...(item.description === undefined
+          ? {}
+          : { description: sanitizeTerminalText(item.description) }),
+        ...(item.searchText === undefined
+          ? {}
+          : { searchText: sanitizeTerminalText(item.searchText) }),
+      }))
+      const list = new SearchableSelectList(
+        safeItems,
+        Math.min(7, Math.max(3, safeItems.length)),
+        options.emptyText ?? 'No matching items',
+        options.initialValue,
+      )
+      let settled = false
+      const settle = (item: SearchableSelectItem | undefined): void => {
+        if (settled) return
+        settled = true
+        signal?.removeEventListener('abort', abort)
+        this.closeInteraction(interaction)
+        if (item === undefined) resolve(undefined)
+        else resolve(items.find(original => original.value === item.value))
+      }
+      const abort = (): void => settle(undefined)
+      list.onSelect = settle
+      list.onCancel = () => settle(undefined)
+      const interaction: ActiveInteraction = {
+        priority: options.priority ?? 'optional',
+        cancel: () => settle(undefined),
+      }
+      this.openInteraction(title, list, 'Type to search · ↑↓ move · Enter select · Esc close', interaction)
       signal?.addEventListener('abort', abort, { once: true })
     })
   }
@@ -967,18 +1201,16 @@ export class DeepSeekTui {
     if (signal?.aborted) return undefined
     const priority = options.priority ?? 'optional'
     this.prepareInteraction(priority)
-    const draft = this.editor.getText()
-    this.editor.setText('')
-    this.editor.setAutocompleteProvider(disabledAutocomplete)
+    const draft = this.editor.getExpandedText()
     return await new Promise<string | undefined>((resolve) => {
       let settled = false
       const settle = (value: string | undefined): void => {
         if (settled) return
         settled = true
         signal?.removeEventListener('abort', abort)
-        if (this.pendingText === pending) this.pendingText = undefined
         this.closeInteraction(interaction)
         this.editor.setText(draft)
+        if (this.pendingText === pending) this.pendingText = undefined
         if (this.autocomplete !== undefined) this.editor.setAutocompleteProvider(this.autocomplete)
         resolve(value)
       }
@@ -995,6 +1227,8 @@ export class DeepSeekTui {
         cancel: () => settle(undefined),
       }
       this.pendingText = pending
+      this.editor.setText('')
+      this.editor.setAutocompleteProvider(disabledAutocomplete)
       this.openInteraction(title, this.editor, 'Type your answer · Enter submit · Esc close', interaction, false)
       signal?.addEventListener('abort', abort, { once: true })
       this.tui.setFocus(this.editor)

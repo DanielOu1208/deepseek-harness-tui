@@ -1,10 +1,34 @@
+<div align="center">
+
 # DeepSeek Harness TUI
+
+**A focused, terminal-native interface for the official DeepSeek Harness.**
+
+[![CI](https://github.com/DanielOu1208/deepseek-harness-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/DanielOu1208/deepseek-harness-tui/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/DanielOu1208/deepseek-harness-tui/actions/workflows/codeql.yml/badge.svg)](https://github.com/DanielOu1208/deepseek-harness-tui/actions/workflows/codeql.yml)
+[![Node.js 22.19+](https://img.shields.io/badge/Node.js-22.19%2B-3c873a?logo=nodedotjs&logoColor=white)](package.json)
+[![License: MIT](https://img.shields.io/badge/License-MIT-4d6bfe.svg)](LICENSE)
+
+<img src="docs/assets/tui-preview.svg" width="920" alt="Interface preview of DeepSeek Harness TUI showing settings, keyboard shortcuts, and context usage">
+
+<sub>Interface preview with sample data. The official Harness remains responsible for models, tools, permissions, sessions, and credentials.</sub>
+
+</div>
 
 A standalone terminal UI for the **official [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)**, rendered with [`@earendil-works/pi-tui`](https://www.npmjs.com/package/@earendil-works/pi-tui).
 
 This package does not fork or replace the Harness. The official runtime still owns the agent loop, models, tools, permissions, sessions, checkpoints, compaction, goals, skills, MCP, subagents, profiles, and credentials. This package adds the `deepseek` launcher, a Cordis profile bundle, and the terminal interaction layer.
 
 > **Status:** experimental MVP pinned to DeepSeek Harness `0.1.0-rc.6`. Keep the launcher and profile bundle on matching versions while the Harness is prerelease software.
+
+## Highlights
+
+| | |
+|---|---|
+| **Official runtime** | Adds a terminal interaction layer without forking the Harness agent loop or persistence model. |
+| **Fast controls** | Switch plan/build mode, reasoning effort, transcript detail, and permissions without leaving the composer. |
+| **Durable workflows** | Resume, rename, fork, archive, inspect, export, and organize sessions by workspace. |
+| **Visible state** | See the active model, reasoning level, permission mode, work status, and approximate context occupancy. |
 
 ## Requirements
 
@@ -77,10 +101,15 @@ Inside the TUI:
 - Ctrl+C closes an open panel and stops the active turn; press it again to exit.
 - Ctrl+D exits when the prompt is empty.
 - F2 opens the settings list.
+- Shift+Tab switches between plan and build mode. During an active turn, the Harness applies the switch at the next safe model step.
+- Shift+Up and Shift+Down raise or lower the reasoning effort for the next model request. The shortcut stops at the highest and lowest advertised levels.
+- Ctrl+V attaches a supported image from the system clipboard when the platform provides one; `/attach path` is the portable fallback.
 - Up/Down and Enter operate menus; Space toggles checkbox answers.
 - `/` opens Harness commands.
 - `@` opens file completion.
 - Transcript detail defaults to Normal and can be changed from F2 → Transcript detail.
+
+The footer shows approximate context occupancy against the active model's capacity, for example `ctx ~42K/1M (4%)`. The estimate describes the next prompt rather than billing usage and updates immediately after compaction. Before the first provider usage sample, the footer shows the known capacity as `ctx —/1M`.
 
 Unknown slash commands are offered to the official Harness command service. Their availability depends on the composed profile.
 
@@ -89,16 +118,40 @@ Common local commands:
 | Command | Purpose |
 |---|---|
 | `/help` | Show local and official Harness commands |
-| `/new`, `/resume` | Start or resume a session |
+| `/new` | Start a fresh session |
+| `/sessions`, `/resume` | Search sessions by title, ID, or working directory |
+| `/resume <session-id>` | Open a known session directly |
+| `/session [session-id]` | Rename, fork, or one-way archive a session |
+| `/workspaces` | Browse non-archived sessions grouped by workspace |
 | `/model`, `/reasoning` | Change the next model request |
-| `/permission` | Change tool access for this session |
+| `/permission <mode>` | Set `read-only`, `workspace-write`, or `danger-full-access` tool access |
 | `/settings` or F2 | Open the Pi-style settings list |
 | `/busy` | Choose queue or steer behavior while an agent is running |
+| `/queue [prompt]` | Manage queued work or queue a separate follow-up turn |
+| `/steer <prompt>` | Inject guidance at the next safe step of the active turn |
+| `/attach [path]` | Manage pending images or attach a PNG, JPEG, GIF, or WebP file |
+| `/deliverables` | Browse paths reported by successful mutation tools |
+| `/inspect` | Search model steps, tool calls, nested calls, timing, and errors |
+| `/stats` | Show whole-session timing and provider token/cache totals |
+| `/activity` | Inspect background jobs, workflows, and subagent descendants |
+| `/export [markdown\|json]` | Atomically export the current session with recognized image payloads removed |
 | `/stop` | Stop the active turn and keep the TUI open |
 | `/pause` | Stop, flush, print the resume ID, and exit |
 | `/exit` | Flush and exit |
 
 The old singular `/setting` spelling remains accepted for compatibility, but is hidden from completion and help.
+
+The session navigator is sorted by recent activity and includes the current session, persisted non-subagent fork sessions, working directory, and short session ID. `/new` creates an unrelated session; `/session` can create a fork at a completed-turn boundary. Subagent-owned sessions stay out of ordinary navigation and are visible under `/activity`. Switching is blocked while queued messages are waiting, because disposing the active Harness agent would otherwise discard that queued work. If a turn is running without queued work, the TUI asks before stopping it.
+
+Archiving is one-way in Harness `0.1.0-rc.6`: `/session` gives a strong warning and defaults to Cancel. Archived logs remain durable and can be found with `/sessions archived`, but the current runtime exposes no safe unarchive operation.
+
+Bare `/queue` can view pending work, replace text-only items in place, and remove an item that has not been claimed. The runtime does not expose queue reordering, so the TUI does not imitate it with private inbox state.
+
+Text drafts are saved per session under `$DSH_HOME/tui/drafts/v1` using owner-private files and restored during navigation. Pending images are intentionally not persisted. The TUI validates and stores images through the official attachment service, shows `[image]` in terminal history, and does not require terminal-specific inline graphics support.
+
+`/export` flushes the current session before writing an owner-private Markdown or versioned JSON file. Official image attachments, common `image`/`image_url` records, binary values, and `data:image` URLs have their raw or encoded payloads removed while reference metadata is preserved. Plugin event shapes are extensible, so always review an export before sharing it; exports can still contain sensitive prompts, tool output, local paths, and unrecognized plugin-defined data.
+
+`danger-full-access` permits unrestricted tool access. Use it only when the current session and working directory are trusted.
 
 ### Transcript detail
 
@@ -109,6 +162,12 @@ The TUI keeps user prompts and assistant answers readable while reducing interna
 - **Debug** shows bounded reasoning, injected context, tool output, and routine runtime events.
 
 The selected mode is saved globally in the Harness `dsh-tui` settings namespace and applies live. It changes only terminal presentation: model context and durable session events remain unchanged. Debug output still has rendering safety limits; the persisted Harness session remains the authoritative source for larger raw content.
+
+### Runtime and provider settings
+
+F2 includes read-only provider capability and Host plugin summaries. Provider profiles remain in `$DSH_HOME/settings.yaml`; TUI profile composition remains under `$DSH_HOME/profiles/tui`; user agent presets remain under `$DSH_HOME/.agent-presets`. Registered settings namespaces can still be changed from F2 → Advanced runtime settings. Credentials are never displayed; use `deepseek auth status` to inspect their source.
+
+F2 → Support and feedback invokes the official `/feedback` command. Its acknowledgement states whether session sharing is enabled, feedback-gated, disabled, or not configured.
 
 ## Update
 
@@ -152,6 +211,8 @@ deepseek launcher
 ```
 
 The bundle overlay is [`cordis.patch.yml`](cordis.patch.yml). It composes this startup parser and TUI runner over `@deepseek-ai/dsh-base`; it does not copy the Harness runtime into this repository.
+
+The living [Web–TUI capability parity matrix](docs/web-tui-parity.md) records what is supported, intentionally terminal-native, or still planned.
 
 ## Troubleshooting
 

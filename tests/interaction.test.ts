@@ -7,7 +7,6 @@ import {
   OTHER_ANSWER_VALUE,
   PERMISSION_PICKER_ITEMS,
   PLAN_PICKER_ITEMS,
-  SETTINGS_PICKER_ITEMS,
   filterPickerItems,
   modelPickerItems,
   parseModelRef,
@@ -18,7 +17,9 @@ import {
   reasoningPickerItems,
   sessionPickerItems,
   settingsNamespacePickerItems,
+  stepReasoningEffort,
 } from '../src/interaction.js'
+import { SETTINGS_PICKER_ITEMS } from '../src/settings-controller.js'
 
 test('parses provider/model while preserving slashes in model ids', () => {
   assert.deepEqual(parseModelRef('openai/gpt-5/codex'), { provider: 'openai', model: 'gpt-5/codex' })
@@ -54,13 +55,16 @@ test('builds nested model picker items with provider-qualified values', () => {
 })
 
 test('builds resume and permission picker items', () => {
-  assert.deepEqual(sessionPickerItems([
-    { id: 'session-new', cwd: '/new', createdAt: 20 },
-    { id: 'session-old', cwd: '/old', createdAt: 10 },
-  ]), [
-    { value: 'session-new', label: 'session-new', description: '/new' },
-    { value: 'session-old', label: 'session-old', description: '/old' },
+  const sessions = sessionPickerItems([
+    { id: 'session-new', title: 'New work', cwd: '/new', createdAt: 20, updatedAt: 30, current: true, running: false },
+    { id: 'session-old', cwd: '/old', createdAt: 10, parentSession: 'session-parent' },
   ])
+  assert.deepEqual(sessions.map(item => ({ value: item.value, label: item.label, searchText: item.searchText })), [
+    { value: 'session-new', label: 'New work', searchText: 'New work session-new /new' },
+    { value: 'session-old', label: 'Untitled session', searchText: 'session-old /old' },
+  ])
+  assert.match(sessions[0]?.description ?? '', /^Current · idle · .* · \/new · session-new$/)
+  assert.match(sessions[1]?.description ?? '', /^Saved · .* · \/old · session-old · fork of session-parent$/)
   assert.deepEqual(PERMISSION_PICKER_ITEMS.map(item => item.value), [
     'read-only', 'workspace-write', 'danger-full-access',
   ])
@@ -104,9 +108,42 @@ test('builds reasoning and busy-behavior picker choices', () => {
   assert.deepEqual(BUSY_PICKER_ITEMS.map(item => item.value), ['queue', 'steer'])
   assert.ok(SETTINGS_PICKER_ITEMS.some(item => item.value === 'advanced'))
   assert.deepEqual(
+    SETTINGS_PICKER_ITEMS.filter(item => ['providers', 'runtime', 'support'].includes(item.value)).map(item => item.value),
+    ['providers', 'runtime', 'support'],
+  )
+  assert.deepEqual(
     SETTINGS_PICKER_ITEMS.find(item => item.value === 'transcript-density'),
     { value: 'transcript-density', label: 'Transcript detail', description: 'Choose how much transcript detail to show' },
   )
+})
+
+test('steps through actual reasoning levels from the effective model default and stops at boundaries', () => {
+  const reasoning = {
+    efforts: [
+      { id: 'off', name: 'Off' },
+      { id: 'high', name: 'High' },
+      { id: 'max', name: 'Max' },
+    ],
+    defaultEffort: 'high',
+  }
+  assert.deepEqual(stepReasoningEffort(reasoning, undefined, 'increase'), { kind: 'change', effort: 'max' })
+  assert.deepEqual(stepReasoningEffort(reasoning, undefined, 'decrease'), { kind: 'change', effort: 'off' })
+  assert.deepEqual(stepReasoningEffort(reasoning, 'max', 'increase'), { kind: 'boundary', effort: 'max' })
+  assert.deepEqual(stepReasoningEffort(reasoning, 'off', 'decrease'), { kind: 'boundary', effort: 'off' })
+})
+
+test('does not guess when reasoning capabilities omit the current effective level', () => {
+  assert.deepEqual(stepReasoningEffort({ efforts: [] }, undefined, 'increase'), {
+    kind: 'unavailable', reason: 'no-efforts',
+  })
+  assert.deepEqual(stepReasoningEffort({ efforts: [{ id: 'high', name: 'High' }] }, undefined, 'increase'), {
+    kind: 'unavailable', reason: 'unknown-default',
+  })
+  assert.deepEqual(stepReasoningEffort({
+    efforts: [{ id: 'high', name: 'High' }], defaultEffort: 'high',
+  }, 'legacy', 'decrease'), {
+    kind: 'unavailable', reason: 'unknown-current',
+  })
 })
 
 test('builds redaction-safe advanced settings choices', () => {

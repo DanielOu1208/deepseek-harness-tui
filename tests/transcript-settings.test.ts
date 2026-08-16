@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { DshTuiRunner } from '../src/index.js'
+import { SettingsController } from '../src/settings-controller.js'
 import {
   DEFAULT_TRANSCRIPT_DENSITY,
   TRANSCRIPT_DENSITIES,
@@ -74,9 +75,20 @@ test('density selection waits for a successful settings update and relies on the
     choose: async () => ({ value: 'compact', label: 'Compact' }),
     appendNotice: () => {},
   }
-  const runner = new DshTuiRunner({} as never, {}, ui as never, scope as never)
+  const controller = new SettingsController({
+    ctx: {} as never,
+    ui: ui as never,
+    transcriptSettings: scope as never,
+    getAgent: () => { throw new Error('not used') },
+    getSelection: () => undefined,
+    setSelectedContextWindow: () => {},
+    runHarnessCommand: async () => {},
+    refresh: () => {},
+    isClosing: () => false,
+    hasPendingImages: () => false,
+  })
 
-  await (runner as unknown as { selectTranscriptDensity(): Promise<void> }).selectTranscriptDensity()
+  await controller.selectTranscriptDensity()
 
   assert.deepEqual(applied, ['normal', 'compact'])
 })

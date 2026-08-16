@@ -13,6 +13,8 @@ export interface PickerItem {
   value: string
   label: string
   description?: string
+  /** Optional text used by searchable pickers without changing the visible row. */
+  searchText?: string
 }
 
 export const OTHER_ANSWER_VALUE = 'answer:other'
@@ -59,17 +61,36 @@ export function modelPickerItems(models: readonly ModelPickerSource[]): PickerIt
 
 export interface SessionPickerSource {
   id: string
+  title?: string
   cwd?: string
   createdAt: number
+  updatedAt?: number
+  parentSession?: string
+  current?: boolean
+  running?: boolean
+  titleUnavailable?: boolean
+}
+
+function shortSessionId(id: string): string {
+  return id.length <= 16 ? id : `…${id.slice(-12)}`
 }
 
 export function sessionPickerItems(sessions: readonly SessionPickerSource[]): PickerItem[] {
   return [...sessions]
-    .sort((left, right) => right.createdAt - left.createdAt)
+    .sort((left, right) => (right.updatedAt ?? right.createdAt) - (left.updatedAt ?? left.createdAt))
     .map(session => ({
       value: session.id,
-      label: session.id,
-      description: session.cwd ?? 'Persisted session',
+      label: session.title ?? 'Untitled session',
+      description: [
+        session.current ? `Current · ${session.running ? 'running' : 'idle'}` : 'Saved',
+        new Date(session.updatedAt ?? session.createdAt).toLocaleString(),
+        session.cwd,
+        shortSessionId(session.id),
+        session.parentSession === undefined ? undefined : `fork of ${shortSessionId(session.parentSession)}`,
+        session.titleUnavailable ? 'title unavailable' : undefined,
+      ].filter((part): part is string => part !== undefined).join(' · '),
+      searchText: [session.title, session.id, session.cwd]
+        .filter((part): part is string => part !== undefined).join(' '),
     }))
 }
 
@@ -99,6 +120,32 @@ export interface ReasoningPickerSource {
   defaultEffort?: string
 }
 
+export type ReasoningStepDirection = 'increase' | 'decrease'
+
+export type ReasoningStepResult =
+  | { kind: 'change'; effort: string }
+  | { kind: 'boundary'; effort: string }
+  | { kind: 'unavailable'; reason: 'no-efforts' | 'unknown-default' | 'unknown-current' }
+
+export function stepReasoningEffort(
+  reasoning: ReasoningPickerSource,
+  currentEffort: string | undefined,
+  direction: ReasoningStepDirection,
+): ReasoningStepResult {
+  if (reasoning.efforts.length === 0) return { kind: 'unavailable', reason: 'no-efforts' }
+  const effective = currentEffort ?? reasoning.defaultEffort
+  if (effective === undefined) return { kind: 'unavailable', reason: 'unknown-default' }
+  const currentIndex = reasoning.efforts.findIndex(effort => effort.id === effective)
+  if (currentIndex < 0) {
+    const reason = currentEffort === undefined ? 'unknown-default' : 'unknown-current'
+    return { kind: 'unavailable', reason }
+  }
+  const delta = direction === 'increase' ? 1 : -1
+  const nextIndex = Math.max(0, Math.min(reasoning.efforts.length - 1, currentIndex + delta))
+  const effort = reasoning.efforts[nextIndex]!.id
+  return nextIndex === currentIndex ? { kind: 'boundary', effort } : { kind: 'change', effort }
+}
+
 export function reasoningPickerItems(reasoning: ReasoningPickerSource): PickerItem[] {
   const defaultName = reasoning.efforts.find(effort => effort.id === reasoning.defaultEffort)?.name
   return [
@@ -120,18 +167,6 @@ export function reasoningPickerItems(reasoning: ReasoningPickerSource): PickerIt
 export const BUSY_PICKER_ITEMS: readonly PickerItem[] = [
   { value: 'queue', label: 'Queue', description: 'Send after the active turn finishes' },
   { value: 'steer', label: 'Steer', description: 'Inject into the nearest active agent step' },
-]
-
-export const SETTINGS_PICKER_ITEMS: readonly PickerItem[] = [
-  { value: 'summary', label: 'Current settings', description: 'Show active session and default values' },
-  { value: 'transcript-density', label: 'Transcript detail', description: 'Choose how much transcript detail to show' },
-  { value: 'model', label: 'Model', description: 'Switch provider and model' },
-  { value: 'reasoning', label: 'Reasoning effort', description: 'Select effort for the current model' },
-  { value: 'permission', label: 'Permission', description: 'Set this session’s tool-access preset' },
-  { value: 'busy', label: 'Busy Enter', description: 'Choose queue or steer while running' },
-  { value: 'save-model-default', label: 'Save model as default', description: 'Use this model and effort for future sessions' },
-  { value: 'save-permission-default', label: 'Save permission as default', description: 'Use this permission preset for future sessions' },
-  { value: 'advanced', label: 'Advanced runtime settings', description: 'Browse and patch registered Harness settings namespaces' },
 ]
 
 export interface SettingsNamespacePickerSource {

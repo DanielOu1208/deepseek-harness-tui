@@ -210,6 +210,7 @@ test('status line includes session, model, work, and token usage within width', 
     provider: 'deepseek-official',
     model: 'deepseek-v4-flash',
     reasoningEffort: 'high',
+    contextWindow: { usedTokens: 42_000, capacityTokens: 1_000_000 },
     usage: { inputTokens: 100, outputTokens: 25 },
   })
 
@@ -218,6 +219,7 @@ test('status line includes session, model, work, and token usage within width', 
   assert.match(rendered[0]!, /running/)
   assert.match(rendered[0]!, /bash/)
   assert.match(rendered[0]!, /high/)
+  assert.match(rendered[0]!, /ctx ~42K\/1M \(4%\)/)
   assert.match(rendered[0]!, /100→25/)
 })
 
@@ -236,6 +238,7 @@ test('status line keeps agent configuration distinct at narrow widths and shows 
     model: 'deepseek-v4-flash',
     reasoningEffort: 'high',
     permissionPreset: 'workspace-write',
+    contextWindow: { usedTokens: 42_000, capacityTokens: 1_000_000 },
   })
 
   const narrow = line.render(55)[0] ?? ''
@@ -243,10 +246,32 @@ test('status line keeps agent configuration distinct at narrow widths and shows 
   assert.match(narrow, /r:high/)
   assert.match(narrow, /plan/)
   assert.match(narrow, /W/)
+  assert.match(narrow, /c:~42K\/1M/)
   assert.match(narrow, /End↑/)
+  const veryNarrow = line.render(40)[0] ?? ''
+  assert.doesNotMatch(veryNarrow, /c:/)
+  assert.match(veryNarrow, /r:high/)
+  assert.match(veryNarrow, /plan/)
+  assert.match(veryNarrow, /W/)
+  assert.match(veryNarrow, /run/)
+  assert.match(veryNarrow, /End↑/)
   const wide = line.render(140)[0] ?? ''
   assert.match(wide, / │ /)
   assert.match(wide, /history ↑ · End to latest/)
+})
+
+test('shows model capacity before the first usage sample and caps displayed occupancy at 100 percent', () => {
+  const line = new StatusLine()
+  const base = {
+    sessionId: 'session-1', entries: [], running: false, activeTools: [], todos: [], compacting: false,
+    planMode: false, provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'high',
+    permissionPreset: 'workspace-write',
+  }
+  line.update({ ...base, contextWindow: { capacityTokens: 1_000_000 } })
+  assert.match(line.render(140)[0] ?? '', /ctx —\/1M/)
+
+  line.update({ ...base, contextWindow: { usedTokens: 1_500_000, capacityTokens: 1_000_000 } })
+  assert.match(line.render(140)[0] ?? '', /ctx ~1\.5M\/1M \(100%\)/)
 })
 
 test('status line bounds long model IDs so required narrow segments remain visible', () => {
@@ -430,6 +455,177 @@ test('routes Escape to the panel and Ctrl+C to both panel cancellation and agent
   ui.stop()
 })
 
+test('routes mode and reasoning shortcuts without changing the composer draft', async () => {
+  const terminal = new FakeTerminal()
+  const ui = new DeepSeekTui(terminal)
+  const actions: string[] = []
+  ui.start({
+    onPrompt: () => {},
+    onSettings: () => {},
+    onTogglePlanMode: () => { actions.push('plan') },
+    onReasoningStep: direction => { actions.push(direction) },
+    onInterrupt: () => {},
+    onExit: () => {},
+  })
+  ui.editor.setText('keep this draft')
+
+  terminal.send('\u001b[Z')
+  terminal.send('\u001b[1;2A')
+  terminal.send('\u001b[b')
+  terminal.send('\u001b[1;2:3A')
+
+  assert.deepEqual(actions, ['plan', 'increase', 'decrease'])
+  assert.equal(ui.editor.getText(), 'keep this draft')
+  ui.stop()
+})
+
+test('locks composer edits and submissions during a session transition while preserving Ctrl+C', () => {
+  const terminal = new FakeTerminal()
+  const ui = new DeepSeekTui(terminal)
+  const prompts: string[] = []
+  let interrupts = 0
+  ui.start({
+    onPrompt: text => { prompts.push(text) },
+    onSettings: () => {},
+    onInterrupt: () => { interrupts += 1 },
+    onExit: () => {},
+  })
+  ui.editor.setText('draft for current session')
+  ui.setComposerLocked(true)
+
+  for (const character of ' unsafe') terminal.send(character)
+  terminal.send('\r')
+  assert.equal(ui.getComposerText(), 'draft for current session')
+  assert.deepEqual(prompts, [])
+
+  terminal.send('\u0003')
+  assert.equal(interrupts, 1)
+  ui.setComposerLocked(false)
+  terminal.send('!')
+  assert.equal(ui.getComposerText(), 'draft for current session!')
+  ui.stop()
+})
+
+test('routes image paste without changing the draft and blocks it during dialogs', async () => {
+  const terminal = new FakeTerminal()
+  const ui = new DeepSeekTui(terminal)
+  let pastes = 0
+  ui.start({
+    onPrompt: () => {},
+    onSettings: () => {},
+    onPasteImage: () => { pastes += 1 },
+    onInterrupt: () => {},
+    onExit: () => {},
+  })
+  ui.editor.setText('keep this draft')
+  terminal.send('\u0016')
+  assert.equal(pastes, 1)
+  assert.equal(ui.editor.getText(), 'keep this draft')
+
+  const dialog = ui.choose('Current dialog', [{ value: 'a', label: 'A' }])
+  terminal.send('\u0016')
+  assert.equal(pastes, 1)
+  terminal.send('\u001b')
+  assert.equal(await dialog, undefined)
+  ui.stop()
+})
+
+test('blocks mode and reasoning shortcuts while a dialog is active', async () => {
+  const terminal = new FakeTerminal()
+  const ui = new DeepSeekTui(terminal)
+  let actions = 0
+  ui.start({
+    onPrompt: () => {},
+    onSettings: () => {},
+    onTogglePlanMode: () => { actions += 1 },
+    onReasoningStep: () => { actions += 1 },
+    onInterrupt: () => {},
+    onExit: () => {},
+  })
+  const dialog = ui.choose('Current dialog', [{ value: 'a', label: 'A' }])
+
+  terminal.send('\u001b[Z')
+  terminal.send('\u001b[1;2A')
+  assert.equal(actions, 0)
+
+  terminal.send('\u001b')
+  assert.equal(await dialog, undefined)
+  ui.stop()
+})
+
+test('searches picker metadata without changing the composer draft', async () => {
+  const terminal = new FakeTerminal()
+  const ui = new DeepSeekTui(terminal)
+  ui.start({
+    onPrompt: () => {},
+    onSettings: () => {},
+    onInterrupt: () => {},
+    onExit: () => {},
+  })
+  ui.editor.setText('keep this draft')
+
+  const pending = ui.chooseSearchable('Sessions', [
+    { value: 'session-current', label: 'Current work', searchText: 'Current work session-current /work/current' },
+    { value: 'session-old', label: 'Refactor parser', searchText: 'Refactor parser session-old /work/compiler' },
+  ], undefined, { initialValue: 'session-current' })
+  for (const character of 'compiler') terminal.send(character)
+  terminal.send('\r')
+
+  assert.equal((await pending)?.value, 'session-old')
+  assert.equal(ui.editor.getText(), 'keep this draft')
+
+  const titleSearch = ui.chooseSearchable('Sessions', [
+    { value: 'session-current', label: 'Current work', searchText: 'Current work session-current /work/current' },
+    { value: 'session-old', label: 'Refactor parser', searchText: 'Refactor parser session-old /work/compiler' },
+  ])
+  for (const character of 'refactor') terminal.send(character)
+  terminal.send('\r')
+  assert.equal((await titleSearch)?.value, 'session-old')
+  ui.stop()
+})
+
+test('preselects the current searchable item and sanitizes untrusted rows', async () => {
+  const terminal = new FakeTerminal()
+  const ui = new DeepSeekTui(terminal)
+  ui.start({
+    onPrompt: () => {},
+    onSettings: () => {},
+    onInterrupt: () => {},
+    onExit: () => {},
+  })
+  const unsafe = '\u001b]52;c;VEVTVA==\u0007'
+  const pending = ui.chooseSearchable('Sessions', [
+    { value: 'other', label: `Other${unsafe}`, description: `unsafe${unsafe}` },
+    { value: 'current', label: `Current${unsafe}`, searchText: `current${unsafe}` },
+  ], undefined, { initialValue: 'current' })
+  const rendered = ui.tui.getFocusedComponent()?.render(80).join('\n') ?? ''
+  assert.doesNotMatch(rendered, /\u001b\]52|VEVTVA/u)
+  terminal.send('\r')
+  assert.equal((await pending)?.value, 'current')
+  ui.stop()
+})
+
+test('keeps a searchable picker open on no matches and lets Escape cancel it', async () => {
+  const terminal = new FakeTerminal()
+  const ui = new DeepSeekTui(terminal)
+  ui.start({
+    onPrompt: () => {},
+    onSettings: () => {},
+    onInterrupt: () => {},
+    onExit: () => {},
+  })
+  const pending = ui.chooseSearchable('Sessions', [
+    { value: 'session-one', label: 'One session' },
+  ], undefined, { emptyText: 'No matching sessions' })
+  for (const character of 'missing') terminal.send(character)
+  const rendered = ui.tui.getFocusedComponent()?.render(80).join('\n') ?? ''
+  assert.match(rendered, /No matching sessions/)
+  terminal.send('\r')
+  terminal.send('\u001b')
+  assert.equal(await pending, undefined)
+  ui.stop()
+})
+
 test('required prompts replace optional input and restore the original composer draft', async () => {
   const ui = new DeepSeekTui(new FakeTerminal())
   ui.editor.setText('composer draft')
@@ -445,6 +641,34 @@ test('required prompts replace optional input and restore the original composer 
   ;(ui as unknown as { activeInteraction: { cancel(): void } }).activeInteraction.cancel()
   assert.equal(await required, undefined)
   assert.equal(ui.editor.getText(), 'composer draft')
+})
+
+test('text dialogs preserve expanded large-paste drafts without publishing an empty draft', async () => {
+  const terminal = new FakeTerminal()
+  const ui = new DeepSeekTui(terminal)
+  const draftChanges: string[] = []
+  ui.start({
+    onPrompt: () => {},
+    onDraftChange: text => { draftChanges.push(text) },
+    onSettings: () => {},
+    onInterrupt: () => {},
+    onExit: () => {},
+  })
+  const pasted = Array.from({ length: 12 }, (_, index) => `line ${String(index + 1)}`).join('\n')
+  terminal.send(`\u001b[200~${pasted}\u001b[201~`)
+  assert.match(ui.editor.getText(), /^\[paste #1 /u)
+  assert.equal(ui.getComposerText(), pasted)
+  assert.equal(draftChanges.at(-1), pasted)
+
+  const changesBeforeDialog = draftChanges.length
+  const prompt = ui.promptText('Temporary answer')
+  assert.equal(draftChanges.length, changesBeforeDialog)
+  terminal.send('\u001b')
+  assert.equal(await prompt, undefined)
+  assert.equal(ui.getComposerText(), pasted)
+  assert.equal(draftChanges.length, changesBeforeDialog)
+  assert.equal(draftChanges.includes(''), false)
+  ui.stop()
 })
 
 test('recognizes common terminal encodings for the settings key', () => {
@@ -507,6 +731,8 @@ test('launch banner uses the official DeepSeek whale and wordmark raster', () =>
   assert.match(banner, /session-123/)
   assert.match(banner, /\/ commands/)
   assert.match(banner, /F2 settings/)
+  assert.match(banner, /Shift\+Tab plan\/build/)
+  assert.match(banner, /Shift\+↑\/↓ reasoning/)
   assert.match(banner, /\/work\/project/)
   assert.ok(Math.max(...plain.split('\n').map(line => line.length)) <= 88)
 })

@@ -66,6 +66,51 @@ test('ignores model-only surface replacements in the human transcript', () => {
   assert.deepEqual(state.entries.map(entry => entry.text), ['Original prompt'])
 })
 
+test('preserves image placeholders in durable user transcript entries', () => {
+  let state = foldSessionEvent(createProjection('session-1'), {
+    seq: 1,
+    time: 1,
+    type: 'user/message',
+    surfaceOp: 'append',
+    data: {
+      source: { kind: 'user' },
+      content: [
+        { type: 'text', text: 'Describe this' },
+        { type: 'image', attachment: { attachmentId: 'image-1', mediaType: 'image/png', bytes: 3 } },
+      ],
+    },
+  })
+  state = foldSessionEvent(state, {
+    seq: 2,
+    time: 2,
+    type: 'user/message',
+    surfaceOp: 'append',
+    data: {
+      source: { kind: 'user' },
+      content: [{ type: 'image', attachment: { attachmentId: 'image-2', mediaType: 'image/jpeg', bytes: 4 } }],
+    },
+  })
+  state = foldSessionEvent(state, {
+    seq: 3,
+    time: 3,
+    type: 'user/message',
+    surfaceOp: 'append',
+    data: {
+      source: { kind: 'user' },
+      content: [
+        { type: 'image', attachment: { attachmentId: 'image-3', mediaType: 'image/webp', bytes: 5 } },
+        { type: 'text', text: 'Caption after image' },
+      ],
+    },
+  })
+
+  assert.deepEqual(state.entries.map(entry => entry.text), [
+    'Describe this\n[image]',
+    '[image]',
+    '[image]\nCaption after image',
+  ])
+})
+
 test('captures live usage chunks and clears prior-turn todos on turn start', () => {
   let state = foldSessionEvent(createProjection('session-1'), {
     seq: 1, time: 1, type: 'todo/write', data: { todos: [{ content: 'Old turn', status: 'pending' }] },
@@ -480,6 +525,29 @@ test('captures the complete model selection for status and settings', () => {
     { provider: state.provider, model: state.model, reasoningEffort: state.reasoningEffort },
     { provider: 'deepseek-official', model: 'deepseek-v4', reasoningEffort: 'high' },
   )
+})
+
+test('tracks the latest model route and advertised context capacity', () => {
+  let state = createProjection('s')
+  state = foldSessionEvent(state, {
+    seq: 1,
+    time: 1,
+    type: 'request/context',
+    data: { provider: 'deepseek-official', model: 'deepseek-v4-flash', contextWindow: 1_000_000 },
+  })
+  assert.deepEqual(state.requestContext, {
+    provider: 'deepseek-official',
+    model: 'deepseek-v4-flash',
+    contextWindow: 1_000_000,
+  })
+
+  state = foldSessionEvent(state, {
+    seq: 2,
+    time: 2,
+    type: 'request/context',
+    data: { provider: 'custom', model: 'unknown-capacity' },
+  })
+  assert.deepEqual(state.requestContext, { provider: 'custom', model: 'unknown-capacity' })
 })
 
 test('keeps repeated plan, permission, and goal changes in chronological history', () => {

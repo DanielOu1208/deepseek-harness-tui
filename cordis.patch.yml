@@ -3,6 +3,31 @@
   disabled: true
 
 - insert:
+    # Terminal-native parity services. These are Host-side state/projection
+    # providers only; the TUI intentionally does not mount the Web client,
+    # API proxy, React, or browser transport layers.
+    - id: tui-storage
+      name: '@deepseek-ai/dsh-storage'
+
+    - id: tui-storage-json
+      name: '@deepseek-ai/dsh-storage-json'
+      config:
+        root: !!js dshHomePath('storages')
+
+    - id: tui-storage-domain
+      name: '@deepseek-ai/dsh-storage-domain'
+      config:
+        backend: json
+
+    - id: tui-workspace
+      name: '@deepseek-ai/dsh-workspace'
+
+    - id: tui-session-stats
+      name: '@deepseek-ai/dsh-session-stats'
+
+    - id: tui-plugin-inventory
+      name: '@deepseek-ai/dsh-host-plugin-inventory'
+
     # The base bundle exposes the question service but intentionally does not
     # mount its model-facing tool. A TUI has a real human answerer, so add it.
     - id: tui-ask-user-tool
