@@ -52,7 +52,7 @@
     "@deepseek-ai/dsh-launch-environment": "0.1.0-rc.6",
     "@deepseek-ai/dsh-tool-ask-user": "0.1.0-rc.6",
     "@deepseek-ai/schemastery": "^3.18.1",
-    "@earendil-works/pi-tui": "0.84.1",
+    "@earendil-works/pi-tui": "0.84.2",
     "commander": "^15.0.0",
     "diff": "^9.0.0"
   },
