@@ -85,10 +85,10 @@
     "@deepseek-ai/dsh-workspace": "0.1.0-rc.6"
   },
   "devDependencies": {
-    "@deepseek-ai/dsh-base": "0.1.0-rc.6",
-    "@types/node": "^24.0.0",
+    "@deepseek-ai/dsh-base": "0.1.0-rc.8",
+    "@types/node": "^26.2.0",
     "tsx": "^4.20.0",
-    "typescript": "^6.0.0"
+    "typescript": "^7.0.2"
   },
   "dsh": {
     "bundle": {"patch": "./cordis.patch.yml"}
